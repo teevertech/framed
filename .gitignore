@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv (keep uv.lock committed)
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Aim
+.aim/
+aim_repo/
+.aim_repo/
+
+# Training artifacts
+training_output/
+models/
+*.zip
+*.pt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
