@@ -33,6 +33,10 @@ models/
 *.zip
 *.pt
 *.pth
+checkpoints/
+gifs/
+eval_gifs/
+.aim/
 
 # IDE
 .vscode/

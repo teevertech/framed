@@ -12,6 +12,9 @@ dependencies = [
     "aim>=3.18",
     "matplotlib>=3.8",
     "numpy>=1.26",
+    "tqdm",
+    "rich",
+    "pillow>=12.2.0",
 ]
 
 [dependency-groups]
@@ -30,4 +33,4 @@ packages = ["src/framed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
-pythonpath = ["src"]
+pythonpath = ["src", "scripts"]
