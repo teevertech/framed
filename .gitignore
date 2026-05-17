@@ -47,3 +47,7 @@ eval_gifs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend
+web/frontend/node_modules/
+web/frontend/dist/

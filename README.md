@@ -1,4 +1,4 @@
-# framed
+# Framed
 
 **I've Been Framed** — an RL-based wall panel assembly sequencer.
 
@@ -10,10 +10,6 @@ panel specification (members, positions, and precedence constraints), the
 trained policy outputs a placement order that minimizes total assembly time —
 accounting for both robot travel distance and collision detour costs — while
 respecting structural dependencies.
-
-This is a portfolio project modeled on the problem space at
-[Promise Robotics](https://www.promiserobotics.com), an Edmonton-based
-startup building robotic manufacturing systems for prefabricated wall frames.
 
 ## Results
 
@@ -84,6 +80,24 @@ uv run python scripts/visualize_episode.py \
     --save trained.gif
 ```
 
+### Web UI
+
+```bash
+# Install web dependencies (Django, DRF, django-cors-headers)
+uv sync --group web
+
+# Terminal 1: Django backend (port 8000)
+uv run python web/backend/manage.py runserver
+
+# Terminal 2: React frontend (port 5173)
+cd web/frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The Vite dev server proxies API calls to Django
+automatically.
+
 ## Project layout
 
 ```
@@ -102,6 +116,20 @@ scripts/
 ├── sweep.py              hyperparameter sweep launcher (portfolio, lr_vs_penalty, etc.)
 ├── evaluate.py           same- and cross-topology generalization testing
 └── visualize_episode.py  interactive or GIF rendering of episodes
+
+web/
+├── backend/
+│   ├── manage.py
+│   ├── framed_api/       Django project (settings, urls, wsgi)
+│   └── api/              DRF app (views, urls — 3 stateless endpoints)
+└── frontend/
+    ├── index.html
+    └── src/
+        ├── App.tsx           main layout: sidebar + comparison panels
+        ├── api/client.ts     typed fetch wrappers for all endpoints
+        ├── hooks/            useAnimation (requestAnimationFrame playback)
+        ├── components/       PanelRenderer, Sidebar, ScoreCards, PlaybackControls
+        └── types/panel.ts    TypeScript interfaces mirroring the API
 
 tests/
 ├── test_panel.py         panel validation, generator invariants
@@ -177,3 +205,6 @@ and would not change.
 real robot path planner would make the reward signal physically accurate.
 The RL formulation stays the same — only the cost function inside `step()`
 changes.
+
+**Multi-robot coordination.** Extending the action space to assign members
+to multiple arms operating simultaneously on the same table.
