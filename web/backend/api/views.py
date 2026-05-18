@@ -6,7 +6,6 @@ GET  /api/models           — list available trained model checkpoints
 """
 from __future__ import annotations
 
-import glob
 import os
 from typing import Any, Callable
 
@@ -211,22 +210,33 @@ def run_sequence(request: Request) -> Response:
 
 @api_view(["GET"])
 def list_models(request: Request) -> Response:
-    """List available trained model checkpoints."""
+    """List available trained model checkpoints, grouped by run.
+
+    Returns: { models: { run_name: [checkpoint, ...] } }
+
+    Example:
+        {
+          "models": {
+            "portfolio_k4.0": ["best_model", "final_model"],
+            "lr_sweep_run1":  ["checkpoint_100k", "final_model"]
+          }
+        }
+    """
     ckpt_dir = settings.CHECKPOINT_DIR
-    models = []
+    grouped: dict[str, list[str]] = {}
 
     if os.path.isdir(ckpt_dir):
-        for dirpath, dirnames, filenames in os.walk(ckpt_dir):
-            for f in filenames:
-                if f.endswith(".zip"):
-                    rel = os.path.relpath(
-                        os.path.join(dirpath, f), ckpt_dir
-                    )
-                    name = rel.replace(".zip", "")
-                    models.append({
-                        "name": name,
-                        "path": rel,
-                    })
+        for dirpath, _dirnames, filenames in os.walk(ckpt_dir):
+            for f in sorted(filenames):
+                if not f.endswith(".zip"):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, f), ckpt_dir)
+                # rel looks like "portfolio_k4.0/final_model.zip"
+                parts = rel.replace("\\", "/").split("/")
+                ckpt = parts[-1].removesuffix(".zip")
+                run = "/".join(parts[:-1]) if len(parts) > 1 else ""
+                grouped.setdefault(run, []).append(ckpt)
 
-    models.sort(key=lambda m: m["name"])
-    return Response({"models": models})
+    # Sort runs; checkpoints within each run are already sorted (filenames).
+    sorted_grouped = dict(sorted(grouped.items()))
+    return Response({"models": sorted_grouped})

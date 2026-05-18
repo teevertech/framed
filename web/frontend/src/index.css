@@ -1,3 +1,118 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ── Color tokens ───────────────────────────────────────────────────────
+   The :root block below provides fallback values only — these are
+   overwritten at runtime by applyTheme() in src/theme.ts, which writes
+   inline style properties to <html>. Inline styles always win over
+   stylesheet rules, regardless of PostCSS reordering or other pipeline
+   behavior, so the theme switch is guaranteed to take effect.
+
+   TO RETHEME THE APP: edit src/theme.ts, not this file.
+   ────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --c-base:         #f9fafb;
+  --c-surface:      #ffffff;
+  --c-subtle:       #f3f4f6;
+  --c-border:       #e5e7eb;
+  --c-divider:      #f3f4f6;
+  --c-text-1:       #111827;
+  --c-text-2:       #4b5563;
+  --c-text-3:       #9ca3af;
+  --c-action:       #111827;
+  --c-action-hover: #374151;
+  --c-action-fg:    #ffffff;
+}
+
+/* ── Base element styles ───────────────────────────────────────────── */
+html {
+  font-family: "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--c-base);
+  color: var(--c-text-1);
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+/* ── Themed scrollbars (Chromium + Firefox) ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-border) transparent;
+}
+::-webkit-scrollbar         { width: 6px; height: 6px; }
+::-webkit-scrollbar-track   { background: transparent; }
+::-webkit-scrollbar-thumb   {
+  background-color: var(--c-border);
+  border-radius: 3px;
+}
+
+/* ── Reusable component classes ──────────────────────────────────── */
+@layer components {
+  input[type="text"],
+  input[type="number"],
+  select {
+    background-color: var(--c-subtle);
+    border: 1px solid var(--c-border);
+    color: var(--c-text-1);
+    border-radius: 0.375rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+    line-height: 1rem;
+    transition-property: color, background-color, border-color;
+    transition-duration: 150ms;
+  }
+  input[type="text"]:focus,
+  input[type="number"]:focus,
+  select:focus {
+    outline: none;
+    box-shadow: 0 0 0 1px #3b82f6;
+  }
+
+  input[type="range"] {
+    accent-color: #3b82f6;
+    cursor: pointer;
+  }
+
+  .btn-primary {
+    width: 100%;
+    padding: 0.5rem 0;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    background-color: var(--c-action);
+    color: var(--c-action-fg);
+    transition-property: color, background-color;
+    transition-duration: 150ms;
+  }
+  .btn-primary:hover    { background-color: var(--c-action-hover); }
+  .btn-primary:disabled { opacity: 0.5; pointer-events: none; }
+
+  .btn-accent {
+    width: 100%;
+    padding: 0.5rem 0;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    background-color: #2563eb;
+    color: #ffffff;
+    transition-property: color, background-color;
+    transition-duration: 150ms;
+  }
+  .btn-accent:hover    { background-color: #1d4ed8; }
+  .btn-accent:disabled { opacity: 0.5; pointer-events: none; }
+
+  .card {
+    background-color: var(--c-surface);
+    border: 1px solid var(--c-border);
+    border-radius: 0.75rem;
+    transition-property: color, background-color, border-color;
+    transition-duration: 150ms;
+  }
+}

@@ -1,6 +1,6 @@
 [project]
 name = "framed"
-version = "0.2.0"
+version = "0.3.0"
 description = "RL-based wall panel assembly sequencer (I've Been Framed)"
 readme = "README.md"
 requires-python = ">=3.12"

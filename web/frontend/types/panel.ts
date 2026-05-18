@@ -37,10 +37,12 @@ export interface SequenceResponse {
   policy: SequenceResult | null;
 }
 
-export interface ModelInfo {
-  name: string;
-  path: string;
-}
+/**
+ * Response shape from GET /api/models.
+ * Keys are run names; values are sorted lists of checkpoint names.
+ * e.g. { "portfolio_k4.0": ["best_model", "final_model"] }
+ */
+export type ModelsResponse = Record<string, string[]>;
 
 /** Lumber colors keyed by MemberKind value string. */
 export const KIND_COLORS: Record<string, string> = {

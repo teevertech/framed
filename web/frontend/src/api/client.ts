@@ -1,4 +1,4 @@
-import type { ModelInfo, PanelData, SequenceResponse } from "@/types/panel";
+import type { ModelsResponse, PanelData, SequenceResponse } from "@/types/panel";
 
 const BASE = "/api";
 
@@ -40,7 +40,7 @@ export async function runSequence(params: {
   return post("/sequence/run", params);
 }
 
-export async function listModels(): Promise<ModelInfo[]> {
-  const data = await get<{ models: ModelInfo[] }>("/models");
+export async function listModels(): Promise<ModelsResponse> {
+  const data = await get<{ models: ModelsResponse }>("/models");
   return data.models;
 }
