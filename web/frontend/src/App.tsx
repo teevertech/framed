@@ -1,12 +1,60 @@
 import { useCallback, useEffect, useState } from "react";
-import { generatePanel, listModels, runSequence } from "@/api/client";
+import { generatePanel, listModels, randomPanel, runSequence } from "@/api/client";
 import { useAnimation } from "@/hooks/useAnimation";
 import CommonInfoBar from "@/components/CommonInfoBar";
 import ComparisonCard from "@/components/ComparisonCard";
 import ModelPicker from "@/components/ModelPicker";
 import Sidebar from "@/components/Sidebar";
 import { applyTheme, darkTheme, lightTheme } from "@/theme";
-import type { ModelsResponse, PanelData, SequenceResponse } from "@/types/panel";
+import type {
+  EvalSummary,
+  ModelsResponse,
+  PanelData,
+  RunMetadata,
+  SequenceResponse,
+} from "@/types/panel";
+
+// ------------------------------------------------------------------ //
+// Eval summary badge (shown alongside the model picker)                //
+// ------------------------------------------------------------------ //
+
+function EvalBadge({ summary }: { summary: EvalSummary }) {
+  return (
+    <div className="flex flex-wrap gap-2 text-xs">
+      <span
+        className="rounded px-1.5 py-0.5"
+        style={{ background: "var(--c-surface-alt, #f0f0f0)" }}
+        title="Win rate vs greedy nearest"
+      >
+        Win {Math.round(summary.win_rate * 100)}%
+      </span>
+      <span
+        className="rounded px-1.5 py-0.5"
+        style={{ background: "var(--c-surface-alt, #f0f0f0)" }}
+        title="Mean improvement over greedy nearest"
+      >
+        Avg +{summary.mean_improvement_pct.toFixed(1)}%
+      </span>
+      <span
+        className="rounded px-1.5 py-0.5"
+        style={{ background: "var(--c-surface-alt, #f0f0f0)" }}
+        title={`Range: +${summary.min_improvement_pct.toFixed(1)}% to +${summary.max_improvement_pct.toFixed(1)}%`}
+      >
+        {summary.min_improvement_pct.toFixed(1)}–{summary.max_improvement_pct.toFixed(1)}%
+      </span>
+      <span
+        className="rounded px-1.5 py-0.5 text-c-text-3"
+        title={`Evaluated on ${summary.n_panels} panels`}
+      >
+        n={summary.n_panels}
+      </span>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ //
+// App                                                                  //
+// ------------------------------------------------------------------ //
 
 export default function App() {
   const [panel, setPanel] = useState<PanelData | null>(null);
@@ -26,8 +74,10 @@ export default function App() {
     return false;
   });
 
-  // Apply theme by writing CSS variables directly onto <html>'s inline
-  // style — bypasses any stylesheet-related processing entirely.
+  useEffect(() => {
+    setResults(null);
+  }, [selectedModel]);
+
   useEffect(() => {
     applyTheme(darkMode ? darkTheme : lightTheme);
     localStorage.setItem("framed-dark", String(darkMode));
@@ -37,20 +87,29 @@ export default function App() {
     listModels()
       .then((m) => {
         setModels(m);
-        for (const [run, ckpts] of Object.entries(m)) {
-          if (ckpts.includes("final_model")) {
+        for (const [run, meta] of Object.entries(m)) {
+          const hasFinal = meta.checkpoints?.some((c) => c.name === "final_model");
+          if (hasFinal) {
             setSelectedModel(`${run}/final_model`);
             return;
           }
         }
         const firstRun = Object.keys(m)[0];
         if (firstRun) {
-          const firstCkpt = m[firstRun]?.[0];
-          if (firstCkpt) setSelectedModel(`${firstRun}/${firstCkpt}`);
+          const firstCkpt = m[firstRun]?.checkpoints?.[0];
+          if (firstCkpt) setSelectedModel(`${firstRun}/${firstCkpt.name}`);
         }
       })
       .catch(() => {});
   }, []);
+
+  // ---- Derived: selected run's metadata ---- //
+
+  const selectedRunName = selectedModel.split("/")[0] ?? "";
+  const selectedRunMeta: RunMetadata | undefined = models[selectedRunName];
+  const evalSummary: EvalSummary | null = selectedRunMeta?.eval_summary ?? null;
+
+  // ---- Animations ---- //
 
   const nearestAnim = useAnimation(results?.greedy_nearest.steps ?? null, speed);
   const policyAnim = useAnimation(
@@ -66,25 +125,22 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [results]);
 
+  // ---- Handlers ---- //
+
+  /** Generate a panel from explicit multi-opening configuration. */
   const handleGenerate = useCallback(
     async (config: {
       wall_length_ft: number;
-      opening_type: string;
-      opening_width_in: number;
-      opening_center_pct: number;
+      openings: Array<{ type: "window" | "door"; width_in: number }>;
       seed: number;
     }) => {
       setLoading(true);
       setError(null);
       setResults(null);
       try {
-        const wallIn = config.wall_length_ft * 12;
-        const centerIn = (config.opening_center_pct / 100) * wallIn;
         const p = await generatePanel({
           wall_length_ft: config.wall_length_ft,
-          opening_type: config.opening_type,
-          opening_width_in: config.opening_width_in,
-          opening_center_x_in: centerIn,
+          openings: config.openings,
           seed: config.seed,
         });
         setPanel(p);
@@ -97,10 +153,27 @@ export default function App() {
     [],
   );
 
+  /** Generate a fully random panel (generalization demo). */
+  const handleRandomPanel = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    setResults(null);
+    try {
+      const p = await randomPanel();
+      setPanel(p);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to generate random panel");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // App.tsx  –  handleRunSequence
   const handleRunSequence = useCallback(async () => {
     if (!panel) return;
     setLoading(true);
     setError(null);
+    setResults(null);
     try {
       const r = await runSequence({
         panel,
@@ -124,6 +197,8 @@ export default function App() {
   const rightResult = results?.policy ?? results?.greedy_cost_aware ?? null;
   const rightLabel  = results?.policy ? "Trained policy" : "Cost-aware greedy";
 
+  // ---- Render ---- //
+
   return (
     <div className="min-h-screen bg-c-base">
       <header className="border-b border-c-border bg-c-surface px-6 py-3 transition-colors">
@@ -136,6 +211,7 @@ export default function App() {
       <div className="flex gap-4 p-4">
         <Sidebar
           onGenerate={handleGenerate}
+          onRandomPanel={handleRandomPanel}
           onRunSequence={handleRunSequence}
           loading={loading}
           collisionPenalty={collisionPenalty}
@@ -162,7 +238,10 @@ export default function App() {
           )}
 
           {panel && (
-            <CommonInfoBar panel={panel} collisionPenalty={collisionPenalty} />
+            <CommonInfoBar
+              panel={panel}
+              collisionPenalty={collisionPenalty}
+            />
           )}
 
           {panel ? (
@@ -180,11 +259,14 @@ export default function App() {
                 result={rightResult}
                 comparisonReward={results?.greedy_nearest.total_reward}
               >
-                <ModelPicker
-                  models={models}
-                  selectedModel={selectedModel}
-                  onSelect={setSelectedModel}
-                />
+                <div className="space-y-2">
+                  <ModelPicker
+                    models={models}
+                    selectedModel={selectedModel}
+                    onSelect={setSelectedModel}
+                  />
+                  {evalSummary && <EvalBadge summary={evalSummary} />}
+                </div>
               </ComparisonCard>
             </div>
           ) : (

@@ -9,8 +9,10 @@ TestStepErrors          Invalid actions raise ValueError loudly.
 TestActionMasks         Mask correctness across the episode lifecycle.
 TestRewardComputation   Travel-time math, collision penalty math.
 TestObservation         Layout, normalization, content correctness.
+TestPaddedObsActionSpace  Fixed-size (MAX_MEMBERS) space invariants.
 TestFullEpisode         Integration: run a full valid sequence end-to-end.
 TestDeterminism         Same panel → same trajectory.
+TestRandomPanelEnv      Variable-member-count panels across resets.
 
 Two test fixtures:
 
@@ -19,6 +21,16 @@ Two test fixtures:
   or sequence matters.
 * ``generate_random_panel(seed=...)`` — used for broader integration
   checks where structure (not exact numbers) is what we're testing.
+
+Observation layout (post-padding refactor)
+------------------------------------------
+Total obs dim = 2 + 13 * MAX_MEMBERS = 652.
+
+  [0:2]                      normalised robot position
+  [2 : 2+MAX]                placed flags (real members; padding = 0)
+  [2+MAX : 2+3*MAX]          normalised centers, x/y interleaved (padding = 0)
+  [2+3*MAX : 2+12*MAX]       kind one-hots, 9 classes (padding = 0)
+  [2+12*MAX : 2+13*MAX]      prereq-satisfied flags (padding = 0)
 """
 from __future__ import annotations
 
@@ -29,7 +41,7 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 
-from framed.env import PanelEnv
+from framed.env import MAX_MEMBERS, PanelEnv, RandomPanelEnv
 from framed.panel import (
     LUMBER_THICKNESS,
     Member,
@@ -38,6 +50,8 @@ from framed.panel import (
     generate_random_panel,
 )
 from framed.units import feet, inches
+
+OBS_DIM = 2 + 13 * MAX_MEMBERS  # 652
 
 
 # ===================================================================== #
@@ -82,12 +96,14 @@ def _simple_panel() -> Panel:
 
 
 def _topo_order_indices(env: PanelEnv) -> list[int]:
-    """Pick any valid placement order using action_masks. Used by integration
-    tests that just need to run a full episode to completion."""
+    """Pick any valid placement order using a locally-computed mask.
+
+    Builds its own placement tracking over ``env.n_members`` (the real member
+    count) so it is independent of the env's padded action_masks().  Used by
+    integration tests that just need to drive a full episode to completion.
+    """
     order: list[int] = []
     placed = np.zeros(env.n_members, dtype=bool)
-    # We replicate the mask logic locally so the test doesn't depend on
-    # the env being mid-episode.
     for _ in range(env.n_members):
         mask = np.zeros(env.n_members, dtype=bool)
         for i, m in enumerate(env.panel.members):
@@ -101,7 +117,6 @@ def _topo_order_indices(env: PanelEnv) -> list[int]:
             }
             if all(p in placed_ids for p in prereq_ids):
                 mask[i] = True
-        # Pick the lowest-index valid action (deterministic).
         candidates = np.flatnonzero(mask)
         assert candidates.size > 0, "graph is acyclic, mask should be non-empty"
         choice = int(candidates[0])
@@ -172,24 +187,32 @@ class TestInit:
         env = PanelEnv(_simple_panel())
         assert env.n_members == 3
 
-    def test_action_space_matches_member_count(self) -> None:
+    def test_action_space_is_discrete_max_members(self) -> None:
+        """action_space is Discrete(MAX_MEMBERS) for any panel — the padded
+        size, not the real member count."""
         env = PanelEnv(_simple_panel())
         assert isinstance(env.action_space, spaces.Discrete)
-        assert env.action_space.n == 3
+        assert env.action_space.n == MAX_MEMBERS
 
     def test_observation_space_shape(self) -> None:
-        """Layout: 2 (robot pos) + n (placed mask) + 2n (centers) = 2 + 3n."""
+        """Obs dim = 2 + 13 * MAX_MEMBERS = 652, regardless of panel size.
+
+        Sections: robot pos (2) | placed flags (MAX) | centers (2*MAX) |
+                  kind one-hots (9*MAX) | prereq flags (MAX).
+        """
         env = PanelEnv(_simple_panel())
         assert isinstance(env.observation_space, spaces.Box)
-        assert env.observation_space.shape == (2 + 3 * 3,)
+        assert env.observation_space.shape == (OBS_DIM,)
         assert env.observation_space.dtype == np.float32
-        assert float(env.observation_space.low.min()) == pytest.approx(0.0)
+        assert float(env.observation_space.low.min())  == pytest.approx(0.0)
         assert float(env.observation_space.high.max()) == pytest.approx(1.0)
 
-    def test_observation_space_scales_with_panel_size(self) -> None:
-        big = generate_random_panel(wall_length=feet(20), seed=0)
-        env = PanelEnv(big)
-        assert env.observation_space.shape == (2 + 3 * len(big.members),)
+    def test_obs_shape_fixed_regardless_of_panel_size(self) -> None:
+        """Panels of any member count must produce the same obs space shape."""
+        for seed in range(5):
+            panel = generate_random_panel(seed=seed)
+            env = PanelEnv(panel)
+            assert env.observation_space.shape == (OBS_DIM,)
 
     def test_rejects_zero_speed(self) -> None:
         with pytest.raises(ValueError, match="robot_speed must be positive"):
@@ -227,12 +250,12 @@ class TestReset:
         assert env.observation_space.contains(obs)
 
     def test_initial_placed_mask_is_all_zeros(self) -> None:
+        """The full placed section obs[2 : 2+MAX_MEMBERS] should be zero —
+        both the real member slots and the padding slots."""
         env = PanelEnv(_simple_panel())
         obs, _ = env.reset()
-        # placed mask occupies indices [2 : 2+n_members]
-        n = env.n_members
-        placed_slice = obs[2 : 2 + n]
-        assert np.all(placed_slice == 0.0)
+        placed_section = obs[2 : 2 + MAX_MEMBERS]
+        assert np.all(placed_section == 0.0)
 
     def test_initial_robot_pos_default_is_origin(self) -> None:
         env = PanelEnv(_simple_panel())
@@ -257,12 +280,11 @@ class TestReset:
     def test_reset_after_steps_clears_state(self) -> None:
         env = PanelEnv(_simple_panel())
         env.reset()
-        # Place the bottom plate
         env.step(0)
-        # Reset and confirm placement is wiped
         obs, info = env.reset()
         assert info["n_placed"] == 0
-        assert np.all(obs[2 : 2 + env.n_members] == 0.0)
+        # Full placed section (real + padding) should be zeroed.
+        assert np.all(obs[2 : 2 + MAX_MEMBERS] == 0.0)
 
     def test_info_at_reset(self) -> None:
         env = PanelEnv(_simple_panel())
@@ -301,10 +323,10 @@ class TestStep:
         env = PanelEnv(_simple_panel())
         env.reset()
         obs, _, _, _, info = env.step(0)
-        # placed[0] (bot) should be 1.0 in the observation
-        assert obs[2 + 0] == 1.0
-        assert obs[2 + 1] == 0.0
-        assert obs[2 + 2] == 0.0
+        # Placed flags for real members live at obs[2], obs[3], obs[4].
+        assert obs[2 + 0] == 1.0   # bot placed
+        assert obs[2 + 1] == 0.0   # stud not yet placed
+        assert obs[2 + 2] == 0.0   # top not yet placed
         assert info["n_placed"] == 1
         assert info["member_id"] == "bot"
         assert info["member_index"] == 0
@@ -356,11 +378,21 @@ class TestStepErrors:
         with pytest.raises(ValueError, match="out of range"):
             env.step(-1)
 
-    def test_action_out_of_range_above_n_raises(self) -> None:
+    def test_action_out_of_range_above_n_members_raises(self) -> None:
+        """step() validates action < n_members (the real count), not < MAX_MEMBERS.
+        For a 3-member panel, action=3 is out of range."""
         env = PanelEnv(_simple_panel())
         env.reset()
         with pytest.raises(ValueError, match="out of range"):
-            env.step(3)  # valid actions are 0, 1, 2
+            env.step(3)
+
+    def test_padding_slot_raises(self) -> None:
+        """Indices in [n_members, MAX_MEMBERS) are padding slots and must
+        raise ValueError — they are never valid actions."""
+        env = PanelEnv(_simple_panel())
+        env.reset()
+        with pytest.raises(ValueError, match="out of range"):
+            env.step(MAX_MEMBERS - 1)
 
     def test_already_placed_member_raises(self) -> None:
         env = PanelEnv(_simple_panel())
@@ -390,10 +422,11 @@ class TestStepErrors:
 class TestActionMasks:
 
     def test_returns_bool_array_of_correct_shape(self) -> None:
+        """action_masks() now returns a MAX_MEMBERS-length array."""
         env = PanelEnv(_simple_panel())
         env.reset()
         mask = env.action_masks()
-        assert mask.shape == (3,)
+        assert mask.shape == (MAX_MEMBERS,)
         assert mask.dtype == bool
 
     def test_returns_fresh_array_each_call(self) -> None:
@@ -407,22 +440,25 @@ class TestActionMasks:
         assert m2[0] is np.True_ or m2[0] == True  # noqa: E712
 
     def test_initial_mask_only_root_members(self) -> None:
-        """Only 'bot' has no prereqs, so only action 0 is valid initially."""
+        """Only 'bot' (index 0) has no prereqs, so only slot 0 is True.
+        All padding slots (index >= n_members) are always False."""
         env = PanelEnv(_simple_panel())
         env.reset()
         mask = env.action_masks()
-        assert mask[0] == True   # noqa: E712
-        assert mask[1] == False  # noqa: E712
-        assert mask[2] == False  # noqa: E712
+        assert mask[0] is np.True_    # bot — no prereqs
+        assert mask[1] is np.False_   # stud — needs bot
+        assert mask[2] is np.False_   # top — needs stud
+        assert not mask[3:].any()     # padding slots permanently False
 
     def test_mask_updates_after_step(self) -> None:
         env = PanelEnv(_simple_panel())
         env.reset()
         env.step(0)  # place bot → unlocks stud
         mask = env.action_masks()
-        assert mask[0] == False  # already placed
-        assert mask[1] == True   # bot placed, stud now valid
-        assert mask[2] == False  # stud not yet placed
+        assert mask[0] is np.False_   # already placed
+        assert mask[1] is np.True_    # bot placed, stud now valid
+        assert mask[2] is np.False_   # stud not yet placed
+        assert not mask[3:].any()     # padding still False
 
     def test_mask_after_terminal_state_is_all_false(self) -> None:
         env = PanelEnv(_simple_panel())
@@ -537,7 +573,6 @@ class TestRewardComputation:
         panel = _collision_panel()
         env = PanelEnv(panel, robot_speed=1.0, collision_penalty_multiplier=2.0)
         env.reset()
-
         env.step(0)  # beam
         env.step(1)  # step_stone, robot at (5, 5)
 
@@ -584,6 +619,8 @@ class TestStateProperties:
         assert env.robot_pos == pytest.approx(bot_center)
 
     def test_placed_mask_shape_and_dtype(self) -> None:
+        """placed_mask is the real-member array (n_members), not the padded
+        MAX_MEMBERS array — it's an internal state view, not the action mask."""
         env = PanelEnv(_simple_panel())
         env.reset()
         m = env.placed_mask
@@ -643,26 +680,85 @@ class TestObservation:
         assert obs[1] == pytest.approx(1.0)
 
     def test_member_centers_section_matches_panel(self) -> None:
-        """obs[2+n : 2+3n] is the flattened normalized member centers,
-        ordered the same as panel.members."""
+        """Centers for real members are stored at obs[2+MAX : 2+MAX+2n],
+        ordered the same as panel.members, normalised by wall dims."""
         panel = _simple_panel()
         env = PanelEnv(panel)
         obs, _ = env.reset()
         n = env.n_members
-        centers_slice = obs[2 + n : 2 + 3 * n].reshape(n, 2)
+        base = 2 + MAX_MEMBERS
+        centers_slice = obs[base : base + n * 2].reshape(n, 2)
         expected = np.array(
             [m.center for m in panel.members], dtype=np.float32
         ) / np.array([panel.wall_length, panel.wall_height], dtype=np.float32)
         np.testing.assert_allclose(centers_slice, expected, rtol=1e-6)
 
     def test_member_centers_in_unit_box(self) -> None:
-        """For any panel, every normalized center should be in [0, 1]."""
+        """For any panel, every normalised center should be in [0, 1]."""
         env = PanelEnv(generate_random_panel(seed=3))
         obs, _ = env.reset()
         n = env.n_members
-        centers = obs[2 + n : 2 + 3 * n]
+        centers = obs[2 + MAX_MEMBERS : 2 + MAX_MEMBERS + n * 2]
         assert centers.min() >= 0.0
         assert centers.max() <= 1.0
+
+    def test_kind_onehots_section(self) -> None:
+        """Each real member's 9-element one-hot sits at the right offset
+        in obs[2+3*MAX : 2+12*MAX].
+
+        Kind indices (alphabetical):
+          0 bottom_cripple | 1 bottom_plate | 2 common_stud | 3 header |
+          4 jack_stud | 5 king_stud | 6 sill_plate | 7 top_cripple |
+          8 top_plate
+        """
+        panel = _simple_panel()  # bot=BOTTOM_PLATE(1), stud=COMMON_STUD(2), top=TOP_PLATE(8)
+        env = PanelEnv(panel)
+        obs, _ = env.reset()
+        base = 2 + 3 * MAX_MEMBERS
+
+        # bot (member 0) → BOTTOM_PLATE → kind index 1
+        bot_onehot = obs[base : base + 9]
+        assert bot_onehot[1] == pytest.approx(1.0)
+        assert bot_onehot.sum() == pytest.approx(1.0)
+
+        # stud (member 1) → COMMON_STUD → kind index 2
+        stud_onehot = obs[base + 9 : base + 18]
+        assert stud_onehot[2] == pytest.approx(1.0)
+        assert stud_onehot.sum() == pytest.approx(1.0)
+
+        # top (member 2) → TOP_PLATE → kind index 8
+        top_onehot = obs[base + 18 : base + 27]
+        assert top_onehot[8] == pytest.approx(1.0)
+        assert top_onehot.sum() == pytest.approx(1.0)
+
+    def test_prereq_satisfied_flags_initial(self) -> None:
+        """Before any placement:
+          bot (no prereqs) → flag = 1.0
+          stud (needs bot, not yet placed) → flag = 0.0
+          top (needs stud, not yet placed) → flag = 0.0
+          padding slots → 0.0
+        """
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + 12 * MAX_MEMBERS
+        assert obs[base + 0] == pytest.approx(1.0)   # bot unlocked
+        assert obs[base + 1] == pytest.approx(0.0)   # stud locked
+        assert obs[base + 2] == pytest.approx(0.0)   # top locked
+        assert np.all(obs[base + n :] == 0.0)         # padding
+
+    def test_prereq_satisfied_flags_update_after_step(self) -> None:
+        """Placing bot unlocks stud; placing stud unlocks top."""
+        env = PanelEnv(_simple_panel())
+        env.reset()
+        base = 2 + 12 * MAX_MEMBERS
+
+        obs, _, _, _, _ = env.step(0)   # place bot
+        assert obs[base + 1] == pytest.approx(1.0)   # stud now unlocked
+        assert obs[base + 2] == pytest.approx(0.0)   # top still locked
+
+        obs, _, _, _, _ = env.step(1)   # place stud
+        assert obs[base + 2] == pytest.approx(1.0)   # top now unlocked
 
     def test_obs_stays_in_observation_space_through_episode(self) -> None:
         env = PanelEnv(generate_random_panel(seed=11))
@@ -671,6 +767,93 @@ class TestObservation:
         for action in _topo_order_indices(env):
             obs, _, _, _, _ = env.step(action)
             assert env.observation_space.contains(obs)
+
+
+# ===================================================================== #
+# Padded observation / action space invariants                          #
+# ===================================================================== #
+
+class TestPaddedObsActionSpace:
+    """Verify the fixed-size padded space invariants introduced by MAX_MEMBERS."""
+
+    def test_obs_shape_is_always_652(self) -> None:
+        """Obs shape is (652,) for any panel regardless of member count."""
+        for seed in range(5):
+            panel = generate_random_panel(seed=seed)
+            env = PanelEnv(panel)
+            obs, _ = env.reset()
+            assert obs.shape == (OBS_DIM,), (
+                f"seed {seed}: expected ({OBS_DIM},), got {obs.shape}"
+            )
+
+    def test_action_space_is_always_max_members(self) -> None:
+        for seed in range(5):
+            env = PanelEnv(generate_random_panel(seed=seed))
+            assert env.action_space.n == MAX_MEMBERS
+
+    def test_padding_slots_in_mask_are_always_false(self) -> None:
+        """Slots [n_members, MAX_MEMBERS) must be False before, during,
+        and after an episode."""
+        env = PanelEnv(_simple_panel())
+        env.reset()
+        n = env.n_members
+        for action in _topo_order_indices(env):
+            mask = env.action_masks()
+            assert not mask[n:].any(), (
+                "Padding slots became True mid-episode"
+            )
+            env.step(action)
+
+    def test_padding_slots_zero_in_placed_section(self) -> None:
+        """For a 3-member panel, obs[2+3 : 2+MAX_MEMBERS] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        assert np.all(obs[2 + n : 2 + MAX_MEMBERS] == 0.0)
+
+    def test_padding_slots_zero_in_centers_section(self) -> None:
+        """Centers section padding: obs[2+MAX+n*2 : 2+3*MAX] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + MAX_MEMBERS
+        assert np.all(obs[base + n * 2 : base + MAX_MEMBERS * 2] == 0.0)
+
+    def test_padding_slots_zero_in_onehots_section(self) -> None:
+        """Kind one-hots padding: obs[2+3*MAX+n*9 : 2+12*MAX] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + 3 * MAX_MEMBERS
+        assert np.all(obs[base + n * 9 : base + MAX_MEMBERS * 9] == 0.0)
+
+    def test_padding_slots_zero_in_prereq_section(self) -> None:
+        """Prereq flags padding: obs[2+12*MAX+n : 2+13*MAX] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + 12 * MAX_MEMBERS
+        assert np.all(obs[base + n :] == 0.0)
+
+    def test_padding_slots_remain_zero_through_episode(self) -> None:
+        """All padding sections stay zero across every step of a full episode."""
+        env = PanelEnv(generate_random_panel(seed=5))
+        obs, _ = env.reset()
+        n = env.n_members
+
+        def _check_padding(obs: np.ndarray) -> None:
+            assert np.all(obs[2 + n : 2 + MAX_MEMBERS] == 0.0), "placed padding"
+            base_c = 2 + MAX_MEMBERS
+            assert np.all(obs[base_c + n * 2 : base_c + MAX_MEMBERS * 2] == 0.0), "centers padding"
+            base_k = 2 + 3 * MAX_MEMBERS
+            assert np.all(obs[base_k + n * 9 : base_k + MAX_MEMBERS * 9] == 0.0), "onehots padding"
+            base_p = 2 + 12 * MAX_MEMBERS
+            assert np.all(obs[base_p + n :] == 0.0), "prereq padding"
+
+        _check_padding(obs)
+        for action in _topo_order_indices(env):
+            obs, _, _, _, _ = env.step(action)
+            _check_padding(obs)
 
 
 # ===================================================================== #
@@ -751,3 +934,61 @@ class TestDeterminism:
             obs_a, _, _, _, _ = env_a.step(action)
             obs_b, _, _, _, _ = env_b.step(action)
             np.testing.assert_array_equal(obs_a, obs_b)
+
+
+# ===================================================================== #
+# RandomPanelEnv                                                        #
+# ===================================================================== #
+
+class TestRandomPanelEnv:
+    """RandomPanelEnv must expose fixed MAX_MEMBERS spaces and accept panels
+    of any member count across resets — padding handles the variable sizes."""
+
+    def test_obs_and_action_space_are_max_members_sized(self) -> None:
+        panels = [generate_random_panel(seed=s) for s in range(3)]
+        it = iter(panels)
+        env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
+        assert env.observation_space.shape == (OBS_DIM,)
+        assert env.action_space.n == MAX_MEMBERS
+
+    def test_spaces_do_not_change_across_resets(self) -> None:
+        """The space objects are created once at init and must not mutate."""
+        panels = [generate_random_panel(seed=s) for s in range(6)]
+        it = iter(panels)
+        env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
+        obs_space_id = id(env.observation_space)
+        act_space_id = id(env.action_space)
+        for _ in range(3):
+            env.reset()
+            assert id(env.observation_space) == obs_space_id
+            assert id(env.action_space) == act_space_id
+
+    def test_accepts_panels_of_different_member_counts(self) -> None:
+        """reset() must not raise when successive panels have different
+        member counts — padding absorbs the difference."""
+        panel_window = generate_random_panel(opening_type="window", seed=0)
+        panel_door   = generate_random_panel(opening_type="door",   seed=0)
+        # Window has more members (sill + bottom cripples) than door.
+        assert len(panel_window.members) != len(panel_door.members)
+
+        # RandomPanelEnv.__init__ calls panel_generator() once to build the
+        # initial inner env, so we need one extra panel beyond the four reset
+        # calls below (5 total = 1 for __init__ + 4 for reset).
+        panel_sequence = [panel_window, panel_door, panel_window, panel_door, panel_window]
+        it = iter(panel_sequence)
+        env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
+
+        for _ in panel_sequence[1:]:   # 4 resets — each pulls the next panel
+            obs, _ = env.reset()
+            assert obs.shape == (OBS_DIM,)
+            assert env.observation_space.contains(obs)
+
+    def test_each_reset_produces_obs_in_observation_space(self) -> None:
+        # RandomPanelEnv.__init__ calls the generator once, so we need
+        # len(panels) + 1 entries: one for __init__ and one per reset call.
+        panels = [generate_random_panel(seed=s) for s in range(5)]
+        it = iter([generate_random_panel(seed=99)] + panels)
+        env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
+        for _ in panels:
+            obs, _ = env.reset()
+            assert env.observation_space.contains(obs)

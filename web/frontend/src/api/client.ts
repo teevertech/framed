@@ -21,16 +21,31 @@ async function get<T>(url: string): Promise<T> {
   return res.json();
 }
 
+/**
+ * Generate a panel from explicit parameters (multi-opening).
+ */
 export async function generatePanel(params: {
   wall_length_ft: number;
-  opening_type: string;
-  opening_width_in: number;
-  opening_center_x_in?: number;
+  openings: Array<{ type: "window" | "door"; width_in: number }>;
   seed: number;
 }): Promise<PanelData> {
   return post("/panels/generate", params);
 }
 
+/**
+ * Generate a fully random panel for generalization demos.
+ * The backend randomizes wall length, opening count, types, and widths.
+ */
+export async function randomPanel(params?: {
+  seed?: number;
+  max_openings?: number;
+}): Promise<PanelData> {
+  return post("/panels/random", params ?? {});
+}
+
+/**
+ * Run greedy baselines + trained policy on a panel.
+ */
 export async function runSequence(params: {
   panel: PanelData;
   robot_speed?: number;
@@ -40,6 +55,9 @@ export async function runSequence(params: {
   return post("/sequence/run", params);
 }
 
+/**
+ * List available trained model runs with rich metadata.
+ */
 export async function listModels(): Promise<ModelsResponse> {
   const data = await get<{ models: ModelsResponse }>("/models");
   return data.models;

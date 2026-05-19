@@ -14,47 +14,59 @@ Or build from the CLI key=value format used by ``scripts/train.py``::
 
     config = TrainConfig.from_overrides({"learning_rate": "1e-4", "n_envs": "4"})
 
-Panel generation and the fixed-topology constraint
----------------------------------------------------
-Different panels can have different numbers of members.  Because
-``PanelEnv``'s observation space shape is ``2 + 3*n_members``, Gymnasium
-requires that every episode uses a panel with the **same** member count.
+Panel generation and the multi-opening sampling distribution
+------------------------------------------------------------
+Each training episode draws a panel from a *distribution* of configurations
+rather than a single fixed topology.  The distribution is defined by:
 
-``make_panel_generator`` achieves this by fixing ``wall_length``,
-``opening_type``, and ``opening_width`` (which jointly determine
-member count) while randomising only ``opening_center_x`` (which shifts
-the opening left or right without adding or removing any members).
+- ``wall_lengths`` — pool of wall lengths sampled uniformly each episode.
+- ``max_openings`` — upper bound on the number of openings per panel (1 is
+  always the minimum).
+- ``opening_types`` — pool of opening types ("window" or "door").
+- ``opening_widths_window`` / ``opening_widths_door`` — per-type width pools.
+
+Because ``PanelEnv``'s observation and action spaces are padded to
+``MAX_MEMBERS = 50`` (defined in ``framed.env``), panels of different member
+counts can appear across resets without requiring a fixed topology.
+``RandomPanelEnv`` no longer enforces a member-count match between episodes.
 """
 from __future__ import annotations
 
 import dataclasses
 import hashlib
 import json
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 import numpy as np
 
-from framed.panel import LUMBER_THICKNESS, Panel, generate_random_panel
+from framed.env import MAX_MEMBERS
+from framed.panel import Panel, generate_panel, generate_random_panel
 from framed.units import feet, inches
 
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # ------------------------------------------------------------------ #
-    # Panel generation                                                     #
+    # Panel generation — sampling distribution                            #
     # ------------------------------------------------------------------ #
 
-    wall_length: float = feet(12)
-    """Wall length in canonical units (inches).
-    Fixed across all episodes to keep ``n_members`` — and therefore the
-    observation space shape — constant."""
+    wall_lengths: tuple[float, ...] = (feet(8), feet(12), feet(16))
+    """Pool of wall lengths (canonical units / inches) to sample from each
+    episode.  All values must be ≤ ``feet(16)``."""
 
-    opening_type: Literal["window", "door"] = "window"
-    """Opening type.  Mixing types in one training run would change member
-    count (windows have a sill; doors do not)."""
+    max_openings: int = 2
+    """Maximum number of openings per episode.  The actual count is sampled
+    uniformly from 1..max_openings each episode."""
 
-    opening_width: float = inches(36)
-    """Rough-opening width in canonical units.  Fixed for the same reason."""
+    opening_types: tuple[str, ...] = ("window", "door")
+    """Pool of opening types to sample from.  Each opening in an episode
+    independently draws from this pool."""
+
+    opening_widths_window: tuple[float, ...] = (inches(24), inches(32), inches(36))
+    """Pool of rough-opening widths (canonical units) for window openings."""
+
+    opening_widths_door: tuple[float, ...] = (inches(32), inches(36))
+    """Pool of rough-opening widths (canonical units) for door openings."""
 
     # ------------------------------------------------------------------ #
     # Environment                                                          #
@@ -96,6 +108,17 @@ class TrainConfig:
     net_arch: tuple[int, ...] = (256, 256)
     """Hidden layer sizes for both actor and critic MLPs."""
 
+    device: str = "auto"
+    """PyTorch device for policy inference and training.  ``"auto"`` lets
+    SB3 choose (usually ``"cpu"``).  Set to ``"mps"`` to use the Apple
+    Metal GPU on Apple-Silicon Macs."""
+
+    torch_threads: int = 0
+    """Number of PyTorch inter-op / intra-op CPU threads.  ``0`` (default)
+    leaves PyTorch's default (all cores).  ``1`` eliminates thread
+    contention with SubprocVecEnv workers and often *increases* FPS for
+    small MLPs."""
+
     # ------------------------------------------------------------------ #
     # Logging and checkpointing                                            #
     # ------------------------------------------------------------------ #
@@ -108,8 +131,9 @@ class TrainConfig:
     aim_repo: str = ".aim"
     """Path to the aim repository (created on first use)."""
 
-    checkpoint_dir: str = "checkpoints"
-    """Directory for model checkpoints."""
+    checkpoint_dir: str = "models"
+    """Root directory for model output.  Each run writes to
+    ``{checkpoint_dir}/{run_name}/``."""
 
     checkpoint_freq: int = 50_000
     """Save a checkpoint every N timesteps."""
@@ -121,7 +145,8 @@ class TrainConfig:
     """Number of fixed panels used for evaluation (baseline + policy)."""
 
     gif_dir: str = "gifs"
-    """Directory for per-eval GIF snapshots.  Set to '' to disable."""
+    """Directory for per-eval GIF snapshots.  Set to '' to disable.
+    Note: ``EvalCallback`` overrides this to ``models/{run_name}/gifs/``."""
 
     gif_fps: int = 20
     """Frame rate for saved GIFs."""
@@ -138,19 +163,17 @@ class TrainConfig:
 
     @property
     def n_members(self) -> int:
-        """Member count for panels produced by this config.
+        """Maximum padded member count used by the observation/action spaces.
 
-        Computed from one sample panel.  Inexpensive, but avoid calling
-        in a tight loop.  Useful for validating generators and sizing
-        the observation space before training starts.
+        Returns ``MAX_MEMBERS`` (currently 50).  Individual panels produced
+        by the sampling distribution may have fewer real members; the env
+        pads the observation to this size automatically.
+
+        The old per-config member count (derived from a single wall length and
+        opening width) is no longer meaningful now that the generator samples
+        from a distribution.
         """
-        sample = generate_random_panel(
-            wall_length=self.wall_length,
-            opening_type=self.opening_type,  # type: ignore[arg-type]
-            opening_width=self.opening_width,
-            seed=0,
-        )
-        return len(sample.members)
+        return MAX_MEMBERS
 
     def effective_run_name(self) -> str:
         """Return ``run_name`` if set, otherwise ``{experiment}_{hash[:8]}``."""
@@ -161,12 +184,21 @@ class TrainConfig:
     def run_id(self) -> str:
         """8-hex-char SHA-1 digest of the training hyperparameters.
 
-        Book-keeping fields (names, paths, seed) are excluded so that two
-        runs that differ only in ``run_name`` share the same id.
+        Book-keeping fields (names, paths, seed) and the sampling-distribution
+        pool fields (``opening_types``, ``opening_widths_*``, ``wall_lengths``)
+        are excluded.  ``max_openings`` is retained because it meaningfully
+        changes the problem complexity.  Two runs that differ only in which
+        widths are in the pool, or in their run name, share the same id.
         """
         exclude = {
             "experiment_name", "run_name", "aim_repo",
             "checkpoint_dir", "seed",
+            # Infrastructure fields — don't affect learning dynamics.
+            "device", "torch_threads",
+            # Distribution pool fields — describe the sampling range, not a
+            # single fixed config.
+            "opening_types", "opening_widths_window", "opening_widths_door",
+            "wall_lengths",
         }
         d = {k: v for k, v in dataclasses.asdict(self).items()
              if k not in exclude}
@@ -180,65 +212,66 @@ class TrainConfig:
     def make_panel_generator(self, seed: int) -> Callable[[], Panel]:
         """Return a callable that yields a new panel on each call.
 
-        ``opening_center_x`` is randomised; all other parameters are fixed
-        so the observation space shape stays constant.  Pass a different
-        ``seed`` to each parallel worker to avoid correlated rollouts.
+        Each call samples a wall length, a number of openings, and a type and
+        width for each opening from the configured pools, then delegates to
+        ``generate_panel`` with a freshly drawn episode seed.
 
-        Why a retry loop
-        ----------------
-        Studs are placed on a regular grid (every ``DEFAULT_STUD_SPACING``
-        inches).  As the opening shifts left/right it can swallow or reveal
-        a stud grid position, changing ``n_members`` by ±1.  Rather than
-        trying to analytically enumerate safe positions, we sample randomly
-        and accept only panels whose member count matches a target derived
-        from the wall centre — the one position guaranteed to succeed.
-        In practice the loop resolves in 1–3 attempts.
+        Padding (``MAX_MEMBERS = 50``) means panels of different member counts
+        are fine across resets — no member-count matching is needed here.
+
+        The inner retry loop handles the rare case where randomly positioned
+        openings don't fit on the wall (``generate_panel`` raises ``ValueError``
+        in that situation).  After 50 failures it falls back to a single
+        36-inch window on the shortest configured wall, which is guaranteed to
+        succeed.
 
         Parameters
         ----------
         seed:
-            Seed for the internal NumPy RNG.  Should be distinct per worker.
+            Seed for the internal NumPy RNG.  Should be distinct per worker
+            to avoid correlated rollouts.
         """
         rng = np.random.default_rng(seed)
-        wall_length = self.wall_length
-        opening_type = self.opening_type
-        opening_width = self.opening_width
-        margin = opening_width / 2.0 + 4.0 * LUMBER_THICKNESS
-        min_cx = margin
-        max_cx = wall_length - margin
-        centre_cx = (min_cx + max_cx) / 2.0
 
-        # Determine the target member count from the centre position.
-        # This is the reference: all generated panels must match it.
-        _reference = generate_random_panel(
-            wall_length=wall_length,
-            opening_type=opening_type,      # type: ignore[arg-type]
-            opening_width=opening_width,
-            opening_center_x=centre_cx,
-            seed=0,
-        )
-        target_n: int = len(_reference.members)
+        # Capture config fields for the closure (avoids repeated self lookups).
+        wall_lengths = self.wall_lengths
+        max_openings = self.max_openings
+        opening_types = self.opening_types
+        opening_widths_window = self.opening_widths_window
+        opening_widths_door = self.opening_widths_door
 
         def _generate() -> Panel:
-            for _ in range(200):
-                cx = float(rng.uniform(min_cx, max_cx))
-                ep_seed = int(rng.integers(0, 2 ** 31))
-                panel = generate_random_panel(
-                    wall_length=wall_length,
-                    opening_type=opening_type,  # type: ignore[arg-type]
-                    opening_width=opening_width,
-                    opening_center_x=cx,
-                    seed=ep_seed,
-                )
-                if len(panel.members) == target_n:
-                    return panel
-            # Fallback: centre position always produces target_n members.
-            return generate_random_panel(
-                wall_length=wall_length,
-                opening_type=opening_type,  # type: ignore[arg-type]
-                opening_width=opening_width,
-                opening_center_x=centre_cx,
-                seed=int(rng.integers(0, 2 ** 31)),
+            wall_length = float(rng.choice(wall_lengths))
+            n_openings = int(rng.integers(1, max_openings + 1))
+
+            openings = []
+            for _ in range(n_openings):
+                kind = str(rng.choice(opening_types))
+                if kind == "window":
+                    width = float(rng.choice(opening_widths_window))
+                else:
+                    width = float(rng.choice(opening_widths_door))
+                openings.append({"type": kind, "width": width})
+
+            ep_seed = int(rng.integers(0, 2 ** 31))
+
+            # Retry loop: handles placement failures (openings don't fit),
+            # NOT member-count mismatches (padding renders those irrelevant).
+            for _ in range(50):
+                try:
+                    return generate_panel(
+                        wall_length=wall_length,
+                        openings=openings,
+                        seed=ep_seed,
+                    )
+                except ValueError:
+                    ep_seed = int(rng.integers(0, 2 ** 31))
+
+            # Fallback: guaranteed-to-succeed minimal panel.
+            return generate_panel(
+                wall_length=min(wall_lengths),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=ep_seed,
             )
 
         return _generate
@@ -258,8 +291,11 @@ class TrainConfig:
         for key, val in overrides.items():
             if isinstance(val, str):
                 val = _coerce(val)
-            # net_arch may arrive as a list from json round-trips.
-            if key == "net_arch" and isinstance(val, list):
+            # net_arch and tuple-of-floats fields may arrive as lists from
+            # JSON round-trips.
+            if key in ("net_arch", "opening_widths_window",
+                        "opening_widths_door", "wall_lengths",
+                        "opening_types") and isinstance(val, list):
                 val = tuple(val)
             coerced[key] = val
         return cls(**coerced)

@@ -8,25 +8,46 @@ placed.
 
 Action space
 ------------
-``Discrete(n_members)``.  Action ``i`` means "place member ``i`` next."
-Invalid actions — members that are already placed, or whose prerequisites
-have not yet been placed — are surfaced via ``action_masks()`` for
-MaskablePPO; if an invalid action is passed to ``step()`` anyway, it
-raises ``ValueError`` (rather than silently penalising) so masking bugs
-fail loudly.
+``Discrete(MAX_MEMBERS)``.  Action ``i`` means "place member ``i`` next."
+Slots ``>= n_members`` are permanently masked False and will raise
+``ValueError`` if passed to ``step()`` anyway (they indicate a masking
+bug, not a valid no-op).
 
 Observation space
 -----------------
-Flat ``Box`` of shape ``(2 + 3*n_members,)`` with all values in ``[0, 1]``:
+Flat ``Box`` of shape ``(652,)`` — i.e. ``(2 + 13 * MAX_MEMBERS,)`` —
+with all values in ``[0, 1]``.  Layout:
 
-    [0:2]           normalized robot position (x, y)
-    [2 : 2+n]       placement mask: 1.0 if member i is placed, else 0.0
-    [2+n : 2+3n]    normalized member centers, flattened as
-                    (c0.x, c0.y, c1.x, c1.y, ...)
+    [0:2]                       normalised robot position (x/L, y/H)
+    [2 : 2+MAX]                 placed flags — 1.0 if placed, 0.0 otherwise
+                                (0.0 for padding slots)
+    [2+MAX : 2+3*MAX]           normalised member centers, flattened as
+                                (c0.x, c0.y, c1.x, c1.y, …)
+                                (0.0 for padding slots)
+    [2+3*MAX : 2+12*MAX]        member kind one-hot (9 classes × MAX_MEMBERS)
+                                (all zeros for padding slots)
+    [2+12*MAX : 2+13*MAX]       prereq-satisfied flag — 1.0 if all prereqs
+                                of member i are placed (or it has none),
+                                0.0 otherwise
+                                (0.0 for padding slots)
 
-Positions are normalized in-env by ``panel.wall_length`` / ``panel.wall_height``.
-See README / design notes on why we picked baked-in normalization over
-``VecNormalize``.
+``MAX_MEMBERS = 50``, so the obs dim is ``2 + 13 * 50 = 652``.
+
+The 9 ``MemberKind`` classes in one-hot order (alphabetical by enum value):
+
+    0  bottom_cripple
+    1  bottom_plate
+    2  common_stud
+    3  header
+    4  jack_stud
+    5  king_stud
+    6  sill_plate
+    7  top_cripple
+    8  top_plate
+
+Positions are normalised in-env by ``panel.wall_length`` /
+``panel.wall_height``.  See README / design notes on why we picked
+baked-in normalisation over ``VecNormalize``.
 
 Reward
 ------
@@ -43,10 +64,10 @@ rule, every step after the first would register a collision (the robot's
 position is always inside the last-placed member), making the penalty a
 uniform per-step tax with no discriminating power for sequencing.
 
-After placing, the robot moves to
-the placed member's center — this is what makes the problem an actual
-sequencing problem rather than independent placement decisions (the cost
-of the next move depends on the previous choice).
+After placing, the robot moves to the placed member's center — this is
+what makes the problem an actual sequencing problem rather than
+independent placement decisions (the cost of the next move depends on
+the previous choice).
 
 Termination
 -----------
@@ -54,13 +75,13 @@ Termination
 action places exactly one member, every episode is exactly ``n_members``
 steps long.  ``truncated`` is never True; there is no time cap.
 
-Episode randomization
+Episode randomisation
 ---------------------
 A ``PanelEnv`` instance is bound to one fixed ``Panel``.  To train across
-many random panels, recreate the env (or use a Gym wrapper that does so)
-between episodes.  This keeps the observation space's shape constant —
-different panels can have different member counts, which would otherwise
-break Gym's "fixed observation space" contract.
+many random panels, recreate the env (or use ``RandomPanelEnv``) between
+episodes.  The padded observation/action space means panels with different
+member counts all share the same fixed Gymnasium spaces, so
+``RandomPanelEnv`` no longer requires a constant member count.
 """
 from __future__ import annotations
 
@@ -71,9 +92,39 @@ import numpy as np
 from gymnasium import spaces
 
 from framed.geometry import path_collides, travel_time
-from framed.panel import Panel
+from framed.panel import MemberKind, Panel
 
 Position = tuple[float, float]
+
+# ------------------------------------------------------------------ #
+# Constants                                                            #
+# ------------------------------------------------------------------ #
+
+MAX_MEMBERS: int = 50
+"""Maximum number of members a panel can have.
+
+All obs/action spaces are sized to this constant so panels with
+different member counts share the same fixed Gymnasium spaces.
+Panels with more members raise ``ValueError`` at env construction time.
+"""
+
+MEMBER_KIND_INDEX: dict[MemberKind, int] = {
+    MemberKind.BOTTOM_CRIPPLE: 0,
+    MemberKind.BOTTOM_PLATE:   1,
+    MemberKind.COMMON_STUD:    2,
+    MemberKind.HEADER:         3,
+    MemberKind.JACK_STUD:      4,
+    MemberKind.KING_STUD:      5,
+    MemberKind.SILL_PLATE:     6,
+    MemberKind.TOP_CRIPPLE:    7,
+    MemberKind.TOP_PLATE:      8,
+}
+"""One-hot index for each ``MemberKind``.  Alphabetical by enum value."""
+
+N_MEMBER_KINDS: int = 9
+
+# Precomputed obs dimension for reference / ONNX export.
+OBS_DIM: int = 2 + 13 * MAX_MEMBERS   # = 652
 
 
 class PanelEnv(gym.Env):
@@ -97,7 +148,8 @@ class PanelEnv(gym.Env):
         Parameters
         ----------
         panel:
-            The wall panel to assemble.  Held by reference; not mutated.
+            The wall panel to assemble.  Must have ``len(members) <=
+            MAX_MEMBERS``.  Held by reference; not mutated.
         robot_speed:
             End-effector speed in canonical units per time unit.  Must be > 0.
             Tunable hyperparameter (default 10.0 in/s).
@@ -117,6 +169,11 @@ class PanelEnv(gym.Env):
                 f"collision_penalty_multiplier must be >= 0, "
                 f"got {collision_penalty_multiplier!r}"
             )
+        if len(panel.members) > MAX_MEMBERS:
+            raise ValueError(
+                f"Panel has {len(panel.members)} members but MAX_MEMBERS={MAX_MEMBERS}. "
+                f"Increase MAX_MEMBERS or reduce the panel size."
+            )
 
         self.panel = panel
         self.n_members = len(panel.members)
@@ -129,7 +186,8 @@ class PanelEnv(gym.Env):
             [m.center for m in panel.members], dtype=np.float32
         )
 
-        # Normalization divisor (broadcasts against (x, y) pairs).
+        # Normalisation divisor: (wall_length, wall_height) broadcasts against
+        # any (x, y) pair.
         self._norm_xy = np.array(
             [panel.wall_length, panel.wall_height], dtype=np.float32
         )
@@ -141,11 +199,19 @@ class PanelEnv(gym.Env):
             for m in panel.members
         ]
 
-        # Spaces.
-        self.action_space = spaces.Discrete(self.n_members)
-        obs_dim = 2 + 3 * self.n_members
+        # Precompute kind one-hots: shape (n_members, N_MEMBER_KINDS).
+        # Only real member slots are populated; padding slots stay zero.
+        self._kind_onehots = np.zeros(
+            (self.n_members, N_MEMBER_KINDS), dtype=np.float32
+        )
+        for i, m in enumerate(panel.members):
+            self._kind_onehots[i, MEMBER_KIND_INDEX[m.kind]] = 1.0
+
+        # Fixed spaces — sized to MAX_MEMBERS so all panels share the same
+        # Gymnasium contract regardless of their actual member count.
+        self.action_space = spaces.Discrete(MAX_MEMBERS)
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32
+            low=0.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
         )
 
         # Runtime state populated by reset().
@@ -184,14 +250,19 @@ class PanelEnv(gym.Env):
         Raises
         ------
         ValueError
-            If *action* is out of range, refers to an already-placed member,
-            or has unmet prerequisites.  Callers using MaskablePPO should
-            never hit these — they indicate a masking bug.
+            If *action* is out of range for *this panel's* real member count
+            (not MAX_MEMBERS), refers to an already-placed member, or has
+            unmet prerequisites.  Callers using MaskablePPO should never hit
+            these — they indicate a masking bug.
         """
         action = int(action)
+        # Validate against n_members, not MAX_MEMBERS — padding slots are
+        # never legal actions even though the action space includes them.
         if not 0 <= action < self.n_members:
             raise ValueError(
-                f"Action {action} out of range [0, {self.n_members})"
+                f"Action {action} out of range [0, {self.n_members}) "
+                f"(panel has {self.n_members} members; "
+                f"slots [{self.n_members}, {MAX_MEMBERS}) are padding)."
             )
 
         member = self.panel.members[action]
@@ -211,14 +282,12 @@ class PanelEnv(gym.Env):
                 f"Check action_masks() before stepping."
             )
 
-        # Compute travel cost from current robot position to the member's center.
-        target: Position = member.center
-        robot_pos: Position = (float(self._robot_pos[0]), float(self._robot_pos[1]))
+        # Travel and collision
+        robot_pos = self.robot_pos
+        target = member.center
         t = travel_time(robot_pos, target, speed=self.robot_speed)
 
-        # Check whether the straight-line path collides with anything
-        # already on the table.  The most recently placed member is excluded:
-        # the robot is "lifting off" from it, not crashing through it.
+        # Liftoff rule: exclude the last-placed member from obstacle set.
         placed_obstacles = [
             m
             for i, (m, p) in enumerate(zip(self.panel.members, self._placed))
@@ -253,13 +322,15 @@ class PanelEnv(gym.Env):
     # ------------------------------------------------------------------ #
 
     def action_masks(self) -> np.ndarray:
-        """Return a boolean array of length ``n_members``.
+        """Return a boolean array of length ``MAX_MEMBERS``.
 
         ``mask[i]`` is True iff member ``i`` is a valid action right now:
-        not yet placed, and all its prerequisites are placed.  Returned as
-        a fresh array each call (no aliasing of internal state).
+        not yet placed, and all its prerequisites are placed.
+
+        Slots ``>= n_members`` are permanently False (padding).  Returned
+        as a fresh array each call (no aliasing of internal state).
         """
-        mask = np.zeros(self.n_members, dtype=bool)
+        mask = np.zeros(MAX_MEMBERS, dtype=bool)
         for i in range(self.n_members):
             if self._placed[i]:
                 continue
@@ -302,11 +373,43 @@ class PanelEnv(gym.Env):
     # ------------------------------------------------------------------ #
 
     def _get_obs(self) -> np.ndarray:
-        """Build the flat observation vector (see module docstring for layout)."""
-        robot_norm = self._robot_pos / self._norm_xy
-        placed_f = self._placed.astype(np.float32)
-        centers_norm = (self._member_centers / self._norm_xy).reshape(-1)
-        return np.concatenate([robot_norm, placed_f, centers_norm]).astype(np.float32)
+        """Build the 652-element flat observation vector.
+
+        Layout (all sections zero-padded to MAX_MEMBERS slots):
+
+            [0:2]               normalised robot position
+            [2 : 2+MAX]         placed flags (real members only)
+            [2+MAX : 2+3*MAX]   normalised centers (real members only, x then y)
+            [2+3*MAX : 2+12*MAX] kind one-hots (real members only, 9 classes each)
+            [2+12*MAX : 2+13*MAX] prereq-satisfied flags (real members only)
+        """
+        obs = np.zeros(OBS_DIM, dtype=np.float32)
+
+        # Robot position (always written, even for empty panels)
+        obs[0:2] = self._robot_pos / self._norm_xy
+
+        # Placed flags — real member slots only; padding stays 0.
+        obs[2 : 2 + self.n_members] = self._placed.astype(np.float32)
+
+        # Normalised centers — two floats per real member slot.
+        base_centers = 2 + MAX_MEMBERS
+        centers_norm = self._member_centers / self._norm_xy   # (n_members, 2)
+        obs[base_centers : base_centers + self.n_members * 2] = centers_norm.reshape(-1)
+
+        # Kind one-hots — 9 floats per real member slot.
+        base_kinds = 2 + 3 * MAX_MEMBERS
+        obs[base_kinds : base_kinds + self.n_members * N_MEMBER_KINDS] = (
+            self._kind_onehots.reshape(-1)
+        )
+
+        # Prereq-satisfied flags — one float per real member slot.
+        base_prereq = 2 + 12 * MAX_MEMBERS
+        for i in range(self.n_members):
+            prereqs = self._prereq_indices[i]
+            if prereqs.size == 0 or self._placed[prereqs].all():
+                obs[base_prereq + i] = 1.0
+
+        return obs
 
     def _get_info(self) -> dict[str, Any]:
         """Common info fields shared by reset() and step() returns."""
@@ -324,12 +427,9 @@ class RandomPanelEnv(gym.Env):
     """``PanelEnv`` variant that generates a fresh panel on every ``reset()``.
 
     Wraps ``PanelEnv`` with a panel generator callable so each episode
-    exposes the agent to a different layout.  Because the Gymnasium
-    contract requires a fixed observation space across all episodes, the
-    generator **must always return panels with the same number of members**.
-    A mismatch raises ``ValueError`` on the first offending reset — see
-    ``framed.config.TrainConfig.make_panel_generator`` for a generator that
-    guarantees this by fixing wall length, opening type, and opening width.
+    exposes the agent to a different layout.  The padded observation/action
+    space (fixed at ``MAX_MEMBERS``) means panels with different member
+    counts are fully compatible — no member-count equality check is needed.
 
     All public properties and methods delegate directly to the inner
     ``PanelEnv``, so this class is a drop-in replacement wherever
@@ -352,16 +452,21 @@ class RandomPanelEnv(gym.Env):
         self._collision_penalty_multiplier = collision_penalty_multiplier
         self._initial_robot_pos = initial_robot_pos
 
-        # Build the initial inner env to establish fixed spaces.
+        # Fixed spaces — derived from MAX_MEMBERS, not the initial panel,
+        # so they remain valid across resets with different panel sizes.
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(MAX_MEMBERS)
+
+        # Build the initial inner env so all properties are available
+        # immediately after construction.
         self._env = PanelEnv(
             panel_generator(),
             robot_speed=robot_speed,
             collision_penalty_multiplier=collision_penalty_multiplier,
             initial_robot_pos=initial_robot_pos,
         )
-        self._n_members: int = len(self._env.panel.members)
-        self.observation_space = self._env.observation_space
-        self.action_space = self._env.action_space
 
     # ------------------------------------------------------------------ #
     # Gym API                                                              #
@@ -373,15 +478,12 @@ class RandomPanelEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Generate a new panel and reset the inner env."""
+        """Generate a new panel and reset the inner env.
+
+        No member-count check is performed — the padded observation/action
+        space handles panels of any size up to ``MAX_MEMBERS``.
+        """
         new_panel = self._panel_generator()
-        if len(new_panel.members) != self._n_members:
-            raise ValueError(
-                f"Panel generator returned {len(new_panel.members)} members "
-                f"but the initial panel had {self._n_members}. "
-                f"Fix generator parameters (wall_length, opening_type, "
-                f"opening_width) so member count stays constant."
-            )
         self._env = PanelEnv(
             new_panel,
             robot_speed=self._robot_speed,
@@ -425,4 +527,5 @@ class RandomPanelEnv(gym.Env):
 
     @property
     def n_members(self) -> int:
-        return self._n_members
+        """Member count of the *current* panel (changes each reset)."""
+        return self._env.n_members

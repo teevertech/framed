@@ -51,7 +51,7 @@ CORS_ALLOWED_ORIGINS = [
 # Where trained model checkpoints live.
 CHECKPOINT_DIR = os.environ.get(
     "FRAMED_CHECKPOINT_DIR",
-    str(PROJECT_ROOT / "checkpoints"),
+    str(PROJECT_ROOT / "models"),
 )
 
 STATIC_URL = "static/"

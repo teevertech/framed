@@ -40,6 +40,7 @@ import random
 from enum import StrEnum
 from typing import Literal, Self
 
+import numpy as np
 from pydantic import BaseModel, Field, model_validator
 
 from framed.units import feet, inches
@@ -68,6 +69,9 @@ DEFAULT_HEADER_DEPTH = inches(3.5)  # single 2x4 header; MVP simplification
 # Sill sits at the bottom of the window rough opening, 36" off the floor.
 DEFAULT_SILL_TOP_Y = feet(3)
 DEFAULT_SILL_THICKNESS = LUMBER_THICKNESS
+
+# Maximum wall length supported (no plate splicing above this).
+MAX_WALL_LENGTH = feet(16)
 
 
 class MemberKind(StrEnum):
@@ -137,12 +141,27 @@ class Member(BaseModel):
         return (x + w / 2, y + h / 2)
 
 
+class OpeningSpec(BaseModel):
+    """Metadata about a single opening (window or door) in a panel.
+
+    Stored on the Panel for the web UI and future CAD import validation.
+    The env itself does not use this field — all placement logic is
+    encoded directly in member prerequisites.
+    """
+
+    kind: Literal["window", "door"]
+    center_x: float          # canonical units, determined at generation time
+    width: float             # canonical units (rough opening width)
+    member_ids: list[str]    # all member ids belonging to this opening
+
+
 class Panel(BaseModel):
     """A wall panel: the full assembly specification."""
 
     wall_length: float = Field(gt=0)
     wall_height: float = Field(gt=0)
     members: list[Member] = Field(min_length=1)
+    openings: list[OpeningSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique_ids(self) -> Self:
@@ -229,7 +248,401 @@ def _interiors_overlap(a: Member, b: Member) -> bool:
     return ax1 < bx2 and bx1 < ax2 and ay1 < by2 and by1 < ay2
 
 
-# ----- Random panel generation -----
+# ------------------------------------------------------------------ #
+# Plate prerequisite helper                                            #
+# ------------------------------------------------------------------ #
+
+def _plate_prereq_for_x(px: float, plate_segments: list[Member]) -> str:
+    """Return the id of the plate segment whose x-extent contains `px`.
+
+    A member at x position `px` (its left edge) belongs to the plate
+    segment where ``segment.position[0] <= px <= segment.right_edge``.
+    The last segment uses ``<=`` on both sides to correctly catch the
+    rightmost king stud whose left edge coincides with the segment's
+    right boundary (e.g. right jack stud at a door's right edge sits at
+    the start of the right plate segment).
+
+    Raises
+    ------
+    ValueError
+        If no segment contains `px` — indicates a geometry bug in the
+        caller (a member placed inside a door gap).
+    """
+    for seg in plate_segments:
+        seg_left = seg.position[0]
+        seg_right = seg_left + seg.size[0]
+        # Use inclusive on both ends; overlapping segment boundaries are
+        # disambiguated by left-to-right iteration (first match wins).
+        if seg_left <= px <= seg_right:
+            return seg.id
+    raise ValueError(
+        f"No plate segment found containing x={px:.4f}. "
+        f"Segments: {[(s.id, s.position[0], s.position[0]+s.size[0]) for s in plate_segments]}"
+    )
+
+
+# ------------------------------------------------------------------ #
+# New multi-opening generator                                          #
+# ------------------------------------------------------------------ #
+
+def generate_panel(
+    wall_length: float = feet(16),
+    openings: list[dict] | None = None,
+    seed: int = 0,
+    stud_spacing: float = DEFAULT_STUD_SPACING,
+    wall_height: float = DEFAULT_WALL_HEIGHT,
+) -> Panel:
+    """Generate a wall panel with one or more windows and/or doors.
+
+    This is the new general generator. ``generate_random_panel`` remains
+    available for backwards compatibility with existing single-opening tests.
+
+    Parameters
+    ----------
+    wall_length:
+        Total wall length in canonical units. Must be ≤ ``feet(16)``.
+    openings:
+        List of dicts, each ``{"type": "window"|"door", "width": float}``.
+        Widths are in canonical units. Defaults to a single 36" window.
+        Order is the user's left-to-right intent; actual x positions are
+        sampled from ``seed`` and members are named by sorted center_x order.
+    seed:
+        Seed for the internal NumPy RNG. Same seed + same config = same panel
+        (the "RTS map seed" contract). The caller never passes center_x.
+    stud_spacing:
+        On-centre stud spacing (default 16").
+    wall_height:
+        Wall height in canonical units (default 8 ft).
+
+    Raises
+    ------
+    ValueError
+        If ``wall_length > feet(16)``, no openings are provided, any opening
+        is too wide to fit on the wall, or the openings cannot be placed
+        without overlapping each other after 200 attempts.
+    """
+    if openings is None:
+        openings = [{"type": "window", "width": inches(36)}]
+
+    # ---- Input validation ---- #
+    if wall_length > MAX_WALL_LENGTH + 1e-9:
+        raise ValueError(
+            f"wall_length {wall_length:.2f} exceeds maximum {MAX_WALL_LENGTH:.2f} "
+            f"(feet(16)). No plate splicing is modelled above this limit."
+        )
+    if len(openings) == 0:
+        raise ValueError("At least one opening is required.")
+
+    # Validate each opening fits individually
+    for i, op in enumerate(openings):
+        w = op["width"]
+        margin = w / 2 + 2 * LUMBER_THICKNESS + feet(1)
+        if margin * 2 > wall_length:
+            raise ValueError(
+                f"Opening {i} (width={w:.2f}) is too wide to fit on wall "
+                f"(wall_length={wall_length:.2f}, required margin={margin:.2f} each side)."
+            )
+
+    # ---- Sample center_x positions with retry ---- #
+    rng = np.random.default_rng(seed)
+    center_xs: list[float] = []
+
+    # Compute individual valid ranges for each opening
+    ranges: list[tuple[float, float]] = []
+    for op in openings:
+        w = op["width"]
+        margin = w / 2 + 2 * LUMBER_THICKNESS + feet(1)
+        ranges.append((margin, wall_length - margin))
+
+    sorted_openings: list[dict] = []
+    for attempt in range(200):
+        # Sample a center_x for each opening independently
+        candidates = [
+            float(rng.uniform(lo, hi)) for (lo, hi) in ranges
+        ]
+        # Sort openings by their sampled center_x to assign left-to-right
+        # indices and validate minimum inter-opening gaps
+        paired = sorted(zip(candidates, openings), key=lambda x: x[0])
+        sorted_center_xs = [cx for cx, _ in paired]
+        sorted_ops = [op for _, op in paired]
+
+        # Check minimum gap between adjacent framing zones
+        valid = True
+        for j in range(len(sorted_ops) - 1):
+            cx_left  = sorted_center_xs[j]
+            w_left   = sorted_ops[j]["width"]
+            cx_right = sorted_center_xs[j + 1]
+            w_right  = sorted_ops[j + 1]["width"]
+
+            # Outer right face of left opening's right king stud
+            framing_right = cx_left + w_left / 2 + 2 * LUMBER_THICKNESS
+            # Outer left face of right opening's left king stud
+            framing_left  = cx_right - w_right / 2 - 2 * LUMBER_THICKNESS
+
+            if framing_left - framing_right < stud_spacing - 1e-6:
+                valid = False
+                break
+
+        if valid:
+            center_xs = sorted_center_xs
+            sorted_openings = sorted_ops
+            break
+    else:
+        raise ValueError(
+            f"Could not place {len(openings)} opening(s) on wall of length "
+            f"{wall_length:.2f} without framing zones overlapping after 200 attempts. "
+            f"Try fewer openings, narrower widths, or a longer wall."
+        )
+
+    # ---- Y-axis geometry (same for all openings) ---- #
+    top_plate_y      = wall_height - LUMBER_THICKNESS
+    header_bottom_y  = DEFAULT_HEADER_BOTTOM_Y
+    header_top_y     = header_bottom_y + DEFAULT_HEADER_DEPTH
+    full_stud_height = top_plate_y - LUMBER_THICKNESS
+
+    if header_top_y >= top_plate_y:
+        raise ValueError(
+            f"Header top ({header_top_y}) reaches top plate bottom "
+            f"({top_plate_y}); no room for top cripples."
+        )
+
+    sill_top_y   = DEFAULT_SILL_TOP_Y
+    sill_bottom_y = sill_top_y - DEFAULT_SILL_THICKNESS
+    if sill_bottom_y <= LUMBER_THICKNESS:
+        raise ValueError(
+            f"Sill bottom ({sill_bottom_y}) at or below bottom plate top "
+            f"({LUMBER_THICKNESS}); no room for bottom cripples."
+        )
+
+    # ---- Build bottom plate segment(s) ---- #
+    # Only DOOR openings split the bottom plate; windows do not.
+    door_gaps: list[tuple[float, float]] = sorted(
+        (cx - op["width"] / 2, cx + op["width"] / 2)
+        for cx, op in zip(center_xs, sorted_openings)
+        if op["type"] == "door"
+    )
+
+    plate_segments: list[Member] = []
+    if not door_gaps:
+        # Single bottom plate, no gaps.
+        plate_segments.append(Member(
+            id="bottom_plate",
+            kind=MemberKind.BOTTOM_PLATE,
+            position=(0.0, 0.0),
+            size=(wall_length, LUMBER_THICKNESS),
+            prerequisites=[],
+        ))
+    else:
+        # One plate segment per gap between door openings.
+        seg_left = 0.0
+        for gap_idx, (door_left, door_right) in enumerate(door_gaps):
+            if door_left - seg_left > 1e-6:
+                plate_segments.append(Member(
+                    id=f"bottom_plate_{len(plate_segments)}",
+                    kind=MemberKind.BOTTOM_PLATE,
+                    position=(seg_left, 0.0),
+                    size=(door_left - seg_left, LUMBER_THICKNESS),
+                    prerequisites=[],
+                ))
+            seg_left = door_right
+        # Final segment after the last door (if any wall remains)
+        if wall_length - seg_left > 1e-6:
+            plate_segments.append(Member(
+                id=f"bottom_plate_{len(plate_segments)}",
+                kind=MemberKind.BOTTOM_PLATE,
+                position=(seg_left, 0.0),
+                size=(wall_length - seg_left, LUMBER_THICKNESS),
+                prerequisites=[],
+            ))
+
+    members: list[Member] = list(plate_segments)
+
+    # ---- Build per-opening members ---- #
+    all_king_ids:        list[str] = []
+    all_common_stud_ids: list[str] = []
+    all_top_cripple_ids: list[str] = []
+
+    # Exclusion zones for common studs: (framing_left, framing_right)
+    exclusion_zones: list[tuple[float, float]] = []
+
+    for i, (cx, op) in enumerate(zip(center_xs, sorted_openings)):
+        prefix = f"opening_{i}_"
+        opening_type: str = op["type"]
+        opening_width: float = op["width"]
+
+        opening_left_x  = cx - opening_width / 2
+        opening_right_x = cx + opening_width / 2
+
+        left_king_x  = opening_left_x  - 2 * LUMBER_THICKNESS
+        right_king_x = opening_right_x + LUMBER_THICKNESS
+        left_jack_x  = opening_left_x  - LUMBER_THICKNESS
+        right_jack_x = opening_right_x
+
+        # Track exclusion zone for this opening
+        framing_left  = left_king_x
+        framing_right = right_king_x + LUMBER_THICKNESS
+        exclusion_zones.append((framing_left, framing_right))
+
+        lk_plate = _plate_prereq_for_x(left_king_x,  plate_segments)
+        rk_plate = _plate_prereq_for_x(right_king_x, plate_segments)
+        lj_plate = _plate_prereq_for_x(left_jack_x,  plate_segments)
+        rj_plate = _plate_prereq_for_x(right_jack_x, plate_segments)
+
+        # 1. King studs
+        left_king_id  = f"{prefix}left_king"
+        right_king_id = f"{prefix}right_king"
+        members.append(Member(
+            id=left_king_id,
+            kind=MemberKind.KING_STUD,
+            position=(left_king_x, LUMBER_THICKNESS),
+            size=(LUMBER_THICKNESS, full_stud_height),
+            prerequisites=[lk_plate],
+        ))
+        members.append(Member(
+            id=right_king_id,
+            kind=MemberKind.KING_STUD,
+            position=(right_king_x, LUMBER_THICKNESS),
+            size=(LUMBER_THICKNESS, full_stud_height),
+            prerequisites=[rk_plate],
+        ))
+        all_king_ids.extend([left_king_id, right_king_id])
+
+        # 2. Jack studs
+        jack_height   = header_bottom_y - LUMBER_THICKNESS
+        left_jack_id  = f"{prefix}left_jack"
+        right_jack_id = f"{prefix}right_jack"
+        members.append(Member(
+            id=left_jack_id,
+            kind=MemberKind.JACK_STUD,
+            position=(left_jack_x, LUMBER_THICKNESS),
+            size=(LUMBER_THICKNESS, jack_height),
+            prerequisites=[lj_plate],
+        ))
+        members.append(Member(
+            id=right_jack_id,
+            kind=MemberKind.JACK_STUD,
+            position=(right_jack_x, LUMBER_THICKNESS),
+            size=(LUMBER_THICKNESS, jack_height),
+            prerequisites=[rj_plate],
+        ))
+
+        # 3. Bottom cripples + sill (windows only)
+        bottom_cripple_ids: list[str] = []
+        if opening_type == "window":
+            bot_cripple_height = sill_bottom_y - LUMBER_THICKNESS
+            for j, x in enumerate(_cripple_x_positions(
+                zone_left=opening_left_x,
+                zone_right=opening_right_x,
+                spacing=stud_spacing,
+            )):
+                cid = f"{prefix}bottom_cripple_{j}"
+                bc_plate = _plate_prereq_for_x(x, plate_segments)
+                members.append(Member(
+                    id=cid,
+                    kind=MemberKind.BOTTOM_CRIPPLE,
+                    position=(x, LUMBER_THICKNESS),
+                    size=(LUMBER_THICKNESS, bot_cripple_height),
+                    prerequisites=[bc_plate],
+                ))
+                bottom_cripple_ids.append(cid)
+
+            # 4. Sill plate
+            members.append(Member(
+                id=f"{prefix}sill",
+                kind=MemberKind.SILL_PLATE,
+                position=(opening_left_x, sill_bottom_y),
+                size=(opening_width, DEFAULT_SILL_THICKNESS),
+                prerequisites=[left_jack_id, right_jack_id] + bottom_cripple_ids,
+            ))
+
+        # 5. Header
+        header_left_x = left_jack_x
+        header_width  = (right_jack_x + LUMBER_THICKNESS) - left_jack_x
+        header_id     = f"{prefix}header"
+        members.append(Member(
+            id=header_id,
+            kind=MemberKind.HEADER,
+            position=(header_left_x, header_bottom_y),
+            size=(header_width, DEFAULT_HEADER_DEPTH),
+            prerequisites=[left_jack_id, right_jack_id],
+        ))
+
+        # 6. Top cripples
+        top_cripple_height = top_plate_y - header_top_y
+        top_cripple_ids: list[str] = []
+        for j, x in enumerate(_cripple_x_positions(
+            zone_left=header_left_x,
+            zone_right=header_left_x + header_width,
+            spacing=stud_spacing,
+        )):
+            cid = f"{prefix}top_cripple_{j}"
+            members.append(Member(
+                id=cid,
+                kind=MemberKind.TOP_CRIPPLE,
+                position=(x, header_top_y),
+                size=(LUMBER_THICKNESS, top_cripple_height),
+                prerequisites=[header_id],
+            ))
+            top_cripple_ids.append(cid)
+        all_top_cripple_ids.extend(top_cripple_ids)
+
+    # ---- Common studs ---- #
+    x_candidates = _common_stud_x_positions(wall_length, stud_spacing)
+    stud_idx = 0
+    for x in x_candidates:
+        stud_left  = x
+        stud_right = x + LUMBER_THICKNESS
+        # Skip if this stud overlaps any opening's exclusion zone
+        if any(
+            stud_right > ez_left and stud_left < ez_right
+            for (ez_left, ez_right) in exclusion_zones
+        ):
+            continue
+        cid = f"common_stud_{stud_idx}"
+        cs_plate = _plate_prereq_for_x(x, plate_segments)
+        members.append(Member(
+            id=cid,
+            kind=MemberKind.COMMON_STUD,
+            position=(x, LUMBER_THICKNESS),
+            size=(LUMBER_THICKNESS, full_stud_height),
+            prerequisites=[cs_plate],
+        ))
+        all_common_stud_ids.append(cid)
+        stud_idx += 1
+
+    # ---- Top plate ---- #
+    top_plate_deps = all_king_ids + all_common_stud_ids + all_top_cripple_ids
+    members.append(Member(
+        id="top_plate",
+        kind=MemberKind.TOP_PLATE,
+        position=(0.0, top_plate_y),
+        size=(wall_length, LUMBER_THICKNESS),
+        prerequisites=top_plate_deps,
+    ))
+
+    # ---- OpeningSpec objects ---- #
+    opening_specs: list[OpeningSpec] = []
+    for i, (cx, op) in enumerate(zip(center_xs, sorted_openings)):
+        prefix = f"opening_{i}_"
+        opening_member_ids = [m.id for m in members if m.id.startswith(prefix)]
+        opening_specs.append(OpeningSpec(
+            kind=op["type"],   # type: ignore[arg-type]
+            center_x=cx,
+            width=op["width"],
+            member_ids=opening_member_ids,
+        ))
+
+    return Panel(
+        wall_length=wall_length,
+        wall_height=wall_height,
+        members=members,
+        openings=opening_specs,
+    )
+
+
+# ------------------------------------------------------------------ #
+# Legacy single-opening generator (unchanged — backwards compatible)   #
+# ------------------------------------------------------------------ #
 
 def generate_random_panel(
     wall_length: float | None = None,
@@ -265,6 +678,7 @@ def generate_random_panel(
         wall_length = feet(rng.choice([8, 10, 12, 14]))
     if opening_width is None:
         opening_width = inches(rng.choice([30, 36, 42, 48]))
+
     if opening_center_x is None:
         # Keep the opening framing (king studs included) clear of the wall
         # ends with at least 1 ft of margin to a wall edge.
@@ -455,6 +869,10 @@ def generate_random_panel(
         members=members,
     )
 
+
+# ------------------------------------------------------------------ #
+# Internal helpers                                                     #
+# ------------------------------------------------------------------ #
 
 def _common_stud_x_positions(
     wall_length: float, spacing: float

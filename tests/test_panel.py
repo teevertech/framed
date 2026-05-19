@@ -1,9 +1,15 @@
 """Tests for the panel data model and random generator.
 
-These pin down the invariants `Panel` enforces (unique ids, in-bounds,
-acyclic prereqs, no overlaps), plus the behavior of `generate_random_panel`
+These pin down the invariants ``Panel`` enforces (unique ids, in-bounds,
+acyclic prereqs, no overlaps), plus the behaviour of ``generate_random_panel``
 (deterministic by seed, all members valid, prereqs form a complete DAG
 that orders every member).
+
+``TestGeneratePanel`` covers the new ``generate_panel`` function: multi-opening
+support, namespaced member IDs (``opening_i_*``), split bottom plates for
+doors, ``OpeningSpec`` metadata, and the wall-length / placement-fit guards.
+The existing ``generate_random_panel`` tests are preserved unchanged — that
+function's API and output format are frozen for backwards compatibility.
 """
 from __future__ import annotations
 
@@ -23,7 +29,9 @@ from framed.panel import (
     Member,
     MemberCategory,
     MemberKind,
+    OpeningSpec,
     Panel,
+    generate_panel,
     generate_random_panel,
 )
 from framed.units import feet, inches
@@ -202,7 +210,9 @@ class TestPanelValidation:
         assert len(panel.members) == 3
 
 
-# ----- Generator -----
+# ===================================================================== #
+# generate_random_panel (legacy function — frozen API)                  #
+# ===================================================================== #
 
 class TestGenerator:
     def test_default_generation_produces_valid_panel(self) -> None:
@@ -331,7 +341,397 @@ class TestGenerator:
             assert len(panel.members) >= 6
 
 
-# ----- Helpers -----
+# ===================================================================== #
+# generate_panel (new multi-opening function)                           #
+# ===================================================================== #
+
+class TestGeneratePanel:
+    """Tests for ``generate_panel`` — multi-opening support with namespaced
+    member IDs, split bottom plates for doors, and ``OpeningSpec`` metadata."""
+
+    # ------------------------------------------------------------------ #
+    # Basics                                                               #
+    # ------------------------------------------------------------------ #
+
+    def test_produces_valid_panel(self) -> None:
+        """Panel construction validates all invariants; reaching here is the test."""
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        assert isinstance(panel, Panel)
+        assert len(panel.members) >= 6
+
+    def test_same_seed_produces_same_panel(self) -> None:
+        kwargs = dict(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+        )
+        a = generate_panel(**kwargs, seed=7)
+        b = generate_panel(**kwargs, seed=7)
+        assert len(a.members) == len(b.members)
+        for ma, mb in zip(a.members, b.members):
+            assert ma.id == mb.id
+            assert ma.position == mb.position
+            assert ma.size == mb.size
+            assert ma.prerequisites == mb.prerequisites
+
+    def test_different_seeds_produce_different_center_positions(self) -> None:
+        """The seed controls opening placement, so different seeds must yield
+        different header positions (proxy for opening center_x)."""
+        kwargs = dict(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+        )
+        cx_values = set()
+        for s in range(10):
+            panel = generate_panel(**kwargs, seed=s)
+            header = next(m for m in panel.members if m.id == "opening_0_header")
+            cx_values.add(header.center[0])
+        assert len(cx_values) > 1
+
+    # ------------------------------------------------------------------ #
+    # Single window — member IDs and structure                            #
+    # ------------------------------------------------------------------ #
+
+    def test_single_window_namespaced_ids(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "opening_0_left_king"  in ids
+        assert "opening_0_right_king" in ids
+        assert "opening_0_left_jack"  in ids
+        assert "opening_0_right_jack" in ids
+        assert "opening_0_header"     in ids
+        assert "opening_0_sill"       in ids
+        assert "top_plate"            in ids
+
+    def test_single_window_single_bottom_plate(self) -> None:
+        """Windows do not split the bottom plate."""
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "bottom_plate"   in ids
+        assert "bottom_plate_0" not in ids
+
+    def test_single_window_has_sill_and_bottom_cripples(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        kinds = {m.kind for m in panel.members}
+        assert MemberKind.SILL_PLATE    in kinds
+        assert MemberKind.BOTTOM_CRIPPLE in kinds
+
+    def test_single_window_header_prereqs(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        header = next(m for m in panel.members if m.id == "opening_0_header")
+        assert "opening_0_left_jack"  in header.prerequisites
+        assert "opening_0_right_jack" in header.prerequisites
+
+    def test_single_window_sill_prereqs(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        sill = next(m for m in panel.members if m.id == "opening_0_sill")
+        assert "opening_0_left_jack"  in sill.prerequisites
+        assert "opening_0_right_jack" in sill.prerequisites
+        bottom_cripple_ids = [
+            m.id for m in panel.members if m.kind == MemberKind.BOTTOM_CRIPPLE
+        ]
+        assert bottom_cripple_ids, "expected at least one bottom cripple"
+        for bid in bottom_cripple_ids:
+            assert bid in sill.prerequisites
+
+    def test_single_window_top_cripples_prereq_header(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        for m in panel.members:
+            if m.kind == MemberKind.TOP_CRIPPLE:
+                assert "opening_0_header" in m.prerequisites
+
+    # ------------------------------------------------------------------ #
+    # Single door — split bottom plate, no sill/cripples                 #
+    # ------------------------------------------------------------------ #
+
+    def test_single_door_split_bottom_plate(self) -> None:
+        """A door opening splits the bottom plate into two named segments."""
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "bottom_plate_0" in ids
+        assert "bottom_plate_1" in ids
+        assert "bottom_plate"   not in ids
+
+    def test_single_door_no_sill_or_bottom_cripples(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
+        kinds = {m.kind for m in panel.members}
+        assert MemberKind.SILL_PLATE     not in kinds
+        assert MemberKind.BOTTOM_CRIPPLE not in kinds
+
+    def test_single_door_bottom_plates_have_no_prereqs(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
+        for m in panel.members:
+            if m.kind == MemberKind.BOTTOM_PLATE:
+                assert m.prerequisites == [], (
+                    f"{m.id} should have no prerequisites (all bottom plates are roots)"
+                )
+
+    def test_single_door_namespaced_ids(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "opening_0_left_king"  in ids
+        assert "opening_0_right_king" in ids
+        assert "opening_0_left_jack"  in ids
+        assert "opening_0_right_jack" in ids
+        assert "opening_0_header"     in ids
+
+    # ------------------------------------------------------------------ #
+    # Two windows — both openings namespaced                              #
+    # ------------------------------------------------------------------ #
+
+    def test_two_windows_namespaced_ids(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "window", "width": inches(24)},
+            ],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        for prefix in ("opening_0", "opening_1"):
+            assert f"{prefix}_left_king"  in ids
+            assert f"{prefix}_right_king" in ids
+            assert f"{prefix}_left_jack"  in ids
+            assert f"{prefix}_right_jack" in ids
+            assert f"{prefix}_header"     in ids
+            assert f"{prefix}_sill"       in ids
+
+    def test_two_windows_single_bottom_plate(self) -> None:
+        """Two windows — still no door, so bottom plate is not split."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "window", "width": inches(24)},
+            ],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "bottom_plate"   in ids
+        assert "bottom_plate_0" not in ids
+
+    def test_two_windows_top_plate_prereqs_cover_all_full_height_members(self) -> None:
+        """Top plate depends on all king studs, common studs, and top cripples
+        across both openings."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "window", "width": inches(24)},
+            ],
+            seed=0,
+        )
+        top_plate = next(m for m in panel.members if m.id == "top_plate")
+        prereq_set = set(top_plate.prerequisites)
+        for m in panel.members:
+            if m.kind in (MemberKind.KING_STUD, MemberKind.COMMON_STUD, MemberKind.TOP_CRIPPLE):
+                assert m.id in prereq_set, (
+                    f"top_plate missing prereq on {m.kind.value} '{m.id}'"
+                )
+
+    # ------------------------------------------------------------------ #
+    # Mixed window + door                                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_mixed_window_and_door_splits_bottom_plate(self) -> None:
+        """The door splits the bottom plate; the window does not add more splits."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(36)},
+                {"type": "door",   "width": inches(32)},
+            ],
+            seed=0,
+        )
+        ids = {m.id for m in panel.members}
+        assert "bottom_plate_0" in ids
+        assert "bottom_plate_1" in ids
+        assert "bottom_plate"   not in ids
+
+    def test_mixed_window_and_door_window_has_sill(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(36)},
+                {"type": "door",   "width": inches(32)},
+            ],
+            seed=0,
+        )
+        kinds = {m.kind for m in panel.members}
+        assert MemberKind.SILL_PLATE in kinds
+
+    # ------------------------------------------------------------------ #
+    # Validation guards                                                    #
+    # ------------------------------------------------------------------ #
+
+    def test_wall_too_long_raises(self) -> None:
+        with pytest.raises(ValueError, match="16"):
+            generate_panel(
+                wall_length=feet(16) + 0.1,
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=0,
+            )
+
+    def test_opening_too_wide_for_wall_raises(self) -> None:
+        """A 90" window cannot fit on an 8-foot wall with the required margins."""
+        with pytest.raises(ValueError):
+            generate_panel(
+                wall_length=feet(8),
+                openings=[{"type": "window", "width": inches(90)}],
+                seed=0,
+            )
+
+    def test_no_openings_raises(self) -> None:
+        """At least one opening is required."""
+        with pytest.raises(ValueError):
+            generate_panel(
+                wall_length=feet(12),
+                openings=[],
+                seed=0,
+            )
+
+    # ------------------------------------------------------------------ #
+    # OpeningSpec metadata                                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_single_window_opening_spec(self) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        assert len(panel.openings) == 1
+        spec = panel.openings[0]
+        assert isinstance(spec, OpeningSpec)
+        assert spec.kind == "window"
+        assert spec.width == pytest.approx(inches(36))
+        # All member_ids in the spec should actually be in the panel.
+        panel_ids = {m.id for m in panel.members}
+        for mid in spec.member_ids:
+            assert mid in panel_ids, f"OpeningSpec references unknown id '{mid}'"
+
+    def test_two_openings_spec_sorted_by_center_x(self) -> None:
+        """OpeningSpec entries are ordered by center_x (left to right)."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "door",   "width": inches(32)},
+            ],
+            seed=5,
+        )
+        assert len(panel.openings) == 2
+        assert panel.openings[0].center_x < panel.openings[1].center_x
+
+    def test_opening_spec_member_ids_prefixed(self) -> None:
+        """All member IDs in each OpeningSpec should carry the matching prefix."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "window", "width": inches(24)},
+            ],
+            seed=0,
+        )
+        for i, spec in enumerate(panel.openings):
+            for mid in spec.member_ids:
+                assert mid.startswith(f"opening_{i}_"), (
+                    f"OpeningSpec[{i}] contains id '{mid}' without expected prefix"
+                )
+
+    # ------------------------------------------------------------------ #
+    # Topological completeness                                             #
+    # ------------------------------------------------------------------ #
+
+    def test_prereqs_form_complete_topological_order_single_window(self) -> None:
+        for seed in range(10):
+            panel = generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            )
+            order = _topological_order(panel)
+            assert len(order) == len(panel.members), (
+                f"Seed {seed}: only {len(order)}/{len(panel.members)} orderable"
+            )
+
+    def test_prereqs_form_complete_topological_order_mixed(self) -> None:
+        for seed in range(10):
+            panel = generate_panel(
+                wall_length=feet(16),
+                openings=[
+                    {"type": "window", "width": inches(24)},
+                    {"type": "door",   "width": inches(32)},
+                ],
+                seed=seed,
+            )
+            order = _topological_order(panel)
+            assert len(order) == len(panel.members), (
+                f"Seed {seed}: only {len(order)}/{len(panel.members)} orderable"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Smoke test                                                           #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.parametrize("seed", list(range(20)))
+    def test_robust_across_many_seeds_single_window(self, seed: int) -> None:
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=seed,
+        )
+        assert isinstance(panel, Panel)
+        assert len(panel.members) >= 6
+
+
+# ===================================================================== #
+# Helpers                                                               #
+# ===================================================================== #
 
 def _topological_order(panel: Panel) -> list[str]:
     """Kahn's algorithm. Returns ids in a valid placement order, or a

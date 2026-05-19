@@ -2,16 +2,20 @@ import { useState } from "react";
 import MemberLegend from "@/components/MemberLegend";
 import PlaybackControls from "@/components/PlaybackControls";
 
+interface OpeningConfig {
+  type: "window" | "door";
+  width_in: number;
+}
+
 interface PanelConfig {
   wall_length_ft: number;
-  opening_type: string;
-  opening_width_in: number;
-  opening_center_pct: number;
+  openings: OpeningConfig[];
   seed: number;
 }
 
 interface Props {
   onGenerate: (config: PanelConfig) => void;
+  onRandomPanel: () => void;
   onRunSequence: () => void;
   loading: boolean;
 
@@ -33,8 +37,17 @@ interface Props {
   onToggleDark: (val: boolean) => void;
 }
 
+const DEFAULT_WINDOW_WIDTHS = [24, 30, 32, 36, 42, 48];
+const DEFAULT_DOOR_WIDTHS = [32, 36];
+const MAX_OPENINGS = 4;
+
+function defaultWidthFor(type: "window" | "door"): number {
+  return type === "window" ? 36 : 36;
+}
+
 export default function Sidebar({
   onGenerate,
+  onRandomPanel,
   onRunSequence,
   loading,
   collisionPenalty,
@@ -54,9 +67,7 @@ export default function Sidebar({
 }: Props) {
   const [panelCfg, setPanelCfg] = useState<PanelConfig>({
     wall_length_ft: 12,
-    opening_type: "window",
-    opening_width_in: 36,
-    opening_center_pct: 50,
+    openings: [{ type: "window", width_in: 36 }],
     seed: 0,
   });
 
@@ -64,9 +75,36 @@ export default function Sidebar({
     setPanelCfg((p) => ({ ...p, seed: Math.floor(Math.random() * 10_000) }));
   }
 
+  function updateOpening(idx: number, patch: Partial<OpeningConfig>) {
+    setPanelCfg((p) => {
+      const next = [...p.openings];
+      const current = next[idx];
+      // If switching type, snap width to a valid default for that type
+      if (patch.type && patch.type !== current.type) {
+        patch.width_in = defaultWidthFor(patch.type);
+      }
+      next[idx] = { ...current, ...patch };
+      return { ...p, openings: next };
+    });
+  }
+
+  function addOpening() {
+    if (panelCfg.openings.length >= MAX_OPENINGS) return;
+    setPanelCfg((p) => ({
+      ...p,
+      openings: [...p.openings, { type: "window", width_in: 36 }],
+    }));
+  }
+
+  function removeOpening(idx: number) {
+    if (panelCfg.openings.length <= 1) return;
+    setPanelCfg((p) => ({
+      ...p,
+      openings: p.openings.filter((_, i) => i !== idx),
+    }));
+  }
+
   return (
-    // sticky + max-h + overflow-y-auto keeps the sidebar from pushing
-    // below the viewport on shorter screens. Full layout pass later.
     <aside className="w-56 shrink-0 sticky top-4 max-h-[calc(100vh-2rem)]
                       overflow-y-auto space-y-3 text-sm pb-2">
       {/* Panel config */}
@@ -76,43 +114,91 @@ export default function Sidebar({
         <Field label="Wall length" value={`${panelCfg.wall_length_ft} ft`}>
           <input
             type="range"
-            min={8} max={20} step={1}
+            min={8} max={16} step={1}
             value={panelCfg.wall_length_ft}
             onChange={(e) => setPanelCfg((p) => ({ ...p, wall_length_ft: Number(e.target.value) }))}
             className="w-full"
           />
         </Field>
 
-        <Field label="Opening type">
-          <select
-            value={panelCfg.opening_type}
-            onChange={(e) => setPanelCfg((p) => ({ ...p, opening_type: e.target.value }))}
-            className="w-full"
-          >
-            <option value="window">Window</option>
-            <option value="door">Door</option>
-          </select>
-        </Field>
+        {/* Openings list */}
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-c-text-2 text-xs">
+              Openings ({panelCfg.openings.length})
+            </span>
+            {panelCfg.openings.length < MAX_OPENINGS && (
+              <button
+                onClick={addOpening}
+                className="text-xs text-c-accent hover:underline"
+              >
+                + Add
+              </button>
+            )}
+          </div>
 
-        <Field label="Opening width" value={`${panelCfg.opening_width_in} in`}>
-          <input
-            type="range"
-            min={24} max={60} step={2}
-            value={panelCfg.opening_width_in}
-            onChange={(e) => setPanelCfg((p) => ({ ...p, opening_width_in: Number(e.target.value) }))}
-            className="w-full"
-          />
-        </Field>
+          <div className="space-y-2">
+            {panelCfg.openings.map((op, idx) => {
+              const widths = op.type === "window"
+                ? DEFAULT_WINDOW_WIDTHS
+                : DEFAULT_DOOR_WIDTHS;
+              return (
+                <div
+                  key={idx}
+                  className="rounded-md border border-c-border p-2 space-y-1.5
+                             bg-c-base transition-colors"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-c-text-3 text-[10px] uppercase tracking-wider">
+                      Opening {idx + 1}
+                    </span>
+                    {panelCfg.openings.length > 1 && (
+                      <button
+                        onClick={() => removeOpening(idx)}
+                        className="text-c-text-3 hover:text-red-500 text-xs
+                                   leading-none transition-colors"
+                        title="Remove opening"
+                        aria-label={`Remove opening ${idx + 1}`}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
 
-        <Field label="Opening position" value={`${panelCfg.opening_center_pct}%`}>
-          <input
-            type="range"
-            min={20} max={80} step={1}
-            value={panelCfg.opening_center_pct}
-            onChange={(e) => setPanelCfg((p) => ({ ...p, opening_center_pct: Number(e.target.value) }))}
-            className="w-full"
-          />
-        </Field>
+                  <select
+                    value={op.type}
+                    onChange={(e) =>
+                      updateOpening(idx, {
+                        type: e.target.value as "window" | "door",
+                      })
+                    }
+                    className="w-full text-xs"
+                  >
+                    <option value="window">Window</option>
+                    <option value="door">Door</option>
+                  </select>
+
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={op.width_in}
+                      onChange={(e) =>
+                        updateOpening(idx, { width_in: Number(e.target.value) })
+                      }
+                      className="flex-1 text-xs"
+                    >
+                      {widths.map((w) => (
+                        <option key={w} value={w}>
+                          {w}"
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-c-text-3 text-[10px] whitespace-nowrap">wide</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
 
         {/* Seed row with randomize button */}
         <div>
@@ -147,9 +233,23 @@ export default function Sidebar({
           />
         </Field>
 
-        <button onClick={() => onGenerate(panelCfg)} disabled={loading} className="btn-primary">
-          {loading ? "Generating…" : "Generate panel"}
-        </button>
+        <div className="flex gap-1.5">
+          <button
+            onClick={() => onGenerate(panelCfg)}
+            disabled={loading}
+            className="btn-primary flex-1"
+          >
+            {loading ? "…" : "Generate"}
+          </button>
+          <button
+            onClick={onRandomPanel}
+            disabled={loading}
+            title="Random wall length, openings, types, and widths"
+            className="btn-primary px-2"
+          >
+            🎲
+          </button>
+        </div>
 
         <button onClick={onRunSequence} disabled={loading} className="btn-accent">
           {loading ? "Running…" : "Run comparison"}
@@ -177,7 +277,6 @@ export default function Sidebar({
 
       {/* Legend */}
       <MemberLegend />
-
     </aside>
   );
 }
