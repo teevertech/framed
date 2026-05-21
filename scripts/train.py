@@ -51,7 +51,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from framed.baselines import greedy_nearest_action, run_episode
 from framed.callbacks import AimTrainingCallback, EvalCallback
 from framed.config import TrainConfig
-from framed.env import MAX_MEMBERS, PanelEnv, RandomPanelEnv
+from framed.env import MAX_MEMBERS, OBS_DIM, PanelEnv, RandomPanelEnv
 from framed.panel import Panel
 
 
@@ -291,7 +291,7 @@ def train(config: TrainConfig) -> None:
     # Export to ONNX for future client-side inference.
     # The obs is a flat float32 vector; masking is applied externally.
     try:
-        dummy_obs = torch.zeros(1, 2 + 13 * MAX_MEMBERS, dtype=torch.float32)
+        dummy_obs = torch.zeros(1, OBS_DIM, dtype=torch.float32)
         onnx_path = os.path.join(run_dir, "final_model.onnx")
         torch.onnx.export(
             model.policy,
@@ -334,7 +334,7 @@ def train(config: TrainConfig) -> None:
         "run_name":    run_name,
         "created_at":  created_at,
         "config":      config.as_dict(),
-        "obs_dim":     2 + 13 * MAX_MEMBERS,
+        "obs_dim":     OBS_DIM,
         "max_members": MAX_MEMBERS,
         "checkpoints": checkpoint_entries,
         "artifacts": {

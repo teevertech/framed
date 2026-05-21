@@ -15,7 +15,7 @@ bug, not a valid no-op).
 
 Observation space
 -----------------
-Flat ``Box`` of shape ``(652,)`` — i.e. ``(2 + 13 * MAX_MEMBERS,)`` —
+Flat ``Box`` of shape ``(803,)`` — i.e. ``(3 + 16 * MAX_MEMBERS,)`` —
 with all values in ``[0, 1]``.  Layout:
 
     [0:2]                       normalised robot position (x/L, y/H)
@@ -24,14 +24,24 @@ with all values in ``[0, 1]``.  Layout:
     [2+MAX : 2+3*MAX]           normalised member centers, flattened as
                                 (c0.x, c0.y, c1.x, c1.y, …)
                                 (0.0 for padding slots)
-    [2+3*MAX : 2+12*MAX]        member kind one-hot (9 classes × MAX_MEMBERS)
+    [2+3*MAX : 2+5*MAX]         normalised member sizes, flattened as
+                                (w0/L, h0/H, w1/L, h1/H, …)
+                                (0.0 for padding slots)
+    [2+5*MAX : 2+14*MAX]        member kind one-hot (9 classes × MAX_MEMBERS)
                                 (all zeros for padding slots)
-    [2+12*MAX : 2+13*MAX]       prereq-satisfied flag — 1.0 if all prereqs
+    [2+14*MAX : 2+15*MAX]       prereq-satisfied flag — 1.0 if all prereqs
                                 of member i are placed (or it has none),
                                 0.0 otherwise
                                 (0.0 for padding slots)
+    [2+15*MAX : 2+16*MAX]       normalised robot-to-member distance for each
+                                member (Euclidean distance / wall diagonal).
+                                Pre-computed so the MLP doesn't waste capacity
+                                learning distance from raw coordinates.
+                                (0.0 for padding slots)
+    [2+16*MAX]                  progress — fraction of members placed
+                                (n_placed / n_members), in [0, 1].
 
-``MAX_MEMBERS = 50``, so the obs dim is ``2 + 13 * 50 = 652``.
+``MAX_MEMBERS = 50``, so the obs dim is ``3 + 16 * 50 = 803``.
 
 The 9 ``MemberKind`` classes in one-hot order (alphabetical by enum value):
 
@@ -124,7 +134,7 @@ MEMBER_KIND_INDEX: dict[MemberKind, int] = {
 N_MEMBER_KINDS: int = 9
 
 # Precomputed obs dimension for reference / ONNX export.
-OBS_DIM: int = 2 + 13 * MAX_MEMBERS   # = 652
+OBS_DIM: int = 3 + 16 * MAX_MEMBERS   # = 803
 
 
 class PanelEnv(gym.Env):
@@ -186,11 +196,19 @@ class PanelEnv(gym.Env):
             [m.center for m in panel.members], dtype=np.float32
         )
 
+        # Per-member sizes cached as (n_members, 2) for obs building.
+        self._member_sizes = np.array(
+            [m.size for m in panel.members], dtype=np.float32
+        )
+
         # Normalisation divisor: (wall_length, wall_height) broadcasts against
         # any (x, y) pair.
         self._norm_xy = np.array(
             [panel.wall_length, panel.wall_height], dtype=np.float32
         )
+
+        # Wall diagonal for normalising robot-to-member distances to [0, 1].
+        self._wall_diag = float(np.linalg.norm(self._norm_xy))
 
         # Precompute prereq indices (not ids) for O(1) per-prereq masking.
         id_to_index = {m.id: i for i, m in enumerate(panel.members)}
@@ -373,41 +391,59 @@ class PanelEnv(gym.Env):
     # ------------------------------------------------------------------ #
 
     def _get_obs(self) -> np.ndarray:
-        """Build the 652-element flat observation vector.
+        """Build the 803-element flat observation vector.
 
         Layout (all sections zero-padded to MAX_MEMBERS slots):
 
-            [0:2]               normalised robot position
-            [2 : 2+MAX]         placed flags (real members only)
-            [2+MAX : 2+3*MAX]   normalised centers (real members only, x then y)
-            [2+3*MAX : 2+12*MAX] kind one-hots (real members only, 9 classes each)
-            [2+12*MAX : 2+13*MAX] prereq-satisfied flags (real members only)
+            [0:2]                  normalised robot position
+            [2 : 2+MAX]            placed flags
+            [2+MAX : 2+3*MAX]      normalised centers (cx, cy pairs)
+            [2+3*MAX : 2+5*MAX]    normalised member sizes (w/L, h/H pairs)
+            [2+5*MAX : 2+14*MAX]   kind one-hots (9 classes each)
+            [2+14*MAX : 2+15*MAX]  prereq-satisfied flags
+            [2+15*MAX : 2+16*MAX]  robot-to-member distances (/ wall diagonal)
+            [2+16*MAX]             progress (fraction placed)
         """
         obs = np.zeros(OBS_DIM, dtype=np.float32)
+        n = self.n_members
 
         # Robot position (always written, even for empty panels)
         obs[0:2] = self._robot_pos / self._norm_xy
 
         # Placed flags — real member slots only; padding stays 0.
-        obs[2 : 2 + self.n_members] = self._placed.astype(np.float32)
+        obs[2 : 2 + n] = self._placed.astype(np.float32)
 
         # Normalised centers — two floats per real member slot.
         base_centers = 2 + MAX_MEMBERS
-        centers_norm = self._member_centers / self._norm_xy   # (n_members, 2)
-        obs[base_centers : base_centers + self.n_members * 2] = centers_norm.reshape(-1)
+        centers_norm = self._member_centers / self._norm_xy   # (n, 2)
+        obs[base_centers : base_centers + n * 2] = centers_norm.reshape(-1)
+
+        # Normalised member sizes — two floats per real member slot.
+        base_sizes = 2 + 3 * MAX_MEMBERS
+        sizes_norm = self._member_sizes / self._norm_xy       # (n, 2)
+        obs[base_sizes : base_sizes + n * 2] = sizes_norm.reshape(-1)
 
         # Kind one-hots — 9 floats per real member slot.
-        base_kinds = 2 + 3 * MAX_MEMBERS
-        obs[base_kinds : base_kinds + self.n_members * N_MEMBER_KINDS] = (
+        base_kinds = 2 + 5 * MAX_MEMBERS
+        obs[base_kinds : base_kinds + n * N_MEMBER_KINDS] = (
             self._kind_onehots.reshape(-1)
         )
 
         # Prereq-satisfied flags — one float per real member slot.
-        base_prereq = 2 + 12 * MAX_MEMBERS
-        for i in range(self.n_members):
+        base_prereq = 2 + 14 * MAX_MEMBERS
+        for i in range(n):
             prereqs = self._prereq_indices[i]
             if prereqs.size == 0 or self._placed[prereqs].all():
                 obs[base_prereq + i] = 1.0
+
+        # Robot-to-member Euclidean distances, normalised by wall diagonal.
+        base_dist = 2 + 15 * MAX_MEMBERS
+        deltas = self._member_centers - self._robot_pos            # (n, 2)
+        dists = np.linalg.norm(deltas, axis=1) / self._wall_diag  # (n,)
+        obs[base_dist : base_dist + n] = dists
+
+        # Progress — fraction of members placed.
+        obs[2 + 16 * MAX_MEMBERS] = self._placed.sum() / n if n > 0 else 0.0
 
         return obs
 
