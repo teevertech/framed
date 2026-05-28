@@ -36,7 +36,6 @@ checks live in the Panel validators.
 """
 from __future__ import annotations
 
-import random
 from enum import StrEnum
 from typing import Literal, Self
 
@@ -294,9 +293,6 @@ def generate_panel(
 ) -> Panel:
     """Generate a wall panel with one or more windows and/or doors.
 
-    This is the new general generator. ``generate_random_panel`` remains
-    available for backwards compatibility with existing single-opening tests.
-
     Parameters
     ----------
     wall_length:
@@ -465,6 +461,11 @@ def generate_panel(
     # Exclusion zones for common studs: (framing_left, framing_right)
     exclusion_zones: list[tuple[float, float]] = []
 
+    # Member IDs collected per opening during the build loop.  Populated
+    # here so that OpeningSpec.member_ids is accurate — collecting by
+    # prefix filter after the fact misses the associated plate segments.
+    opening_member_ids: list[list[str]] = [[] for _ in sorted_openings]
+
     for i, (cx, op) in enumerate(zip(center_xs, sorted_openings)):
         prefix = f"opening_{i}_"
         opening_type: str = op["type"]
@@ -488,6 +489,14 @@ def generate_panel(
         lj_plate = _plate_prereq_for_x(left_jack_x,  plate_segments)
         rj_plate = _plate_prereq_for_x(right_jack_x, plate_segments)
 
+        # Associate the plate segment(s) that support this opening's framing.
+        # For windows this is always one segment; for doors it may be two
+        # (left and right of the gap).  Use a set to deduplicate when both
+        # sides land on the same segment.
+        for plate_id in dict.fromkeys([lk_plate, rk_plate, lj_plate, rj_plate]):
+            if plate_id not in opening_member_ids[i]:
+                opening_member_ids[i].append(plate_id)
+
         # 1. King studs
         left_king_id  = f"{prefix}left_king"
         right_king_id = f"{prefix}right_king"
@@ -506,6 +515,7 @@ def generate_panel(
             prerequisites=[rk_plate],
         ))
         all_king_ids.extend([left_king_id, right_king_id])
+        opening_member_ids[i].extend([left_king_id, right_king_id])
 
         # 2. Jack studs
         jack_height   = header_bottom_y - LUMBER_THICKNESS
@@ -525,6 +535,7 @@ def generate_panel(
             size=(LUMBER_THICKNESS, jack_height),
             prerequisites=[rj_plate],
         ))
+        opening_member_ids[i].extend([left_jack_id, right_jack_id])
 
         # 3. Bottom cripples + sill (windows only)
         bottom_cripple_ids: list[str] = []
@@ -547,13 +558,15 @@ def generate_panel(
                 bottom_cripple_ids.append(cid)
 
             # 4. Sill plate
+            sill_id = f"{prefix}sill"
             members.append(Member(
-                id=f"{prefix}sill",
+                id=sill_id,
                 kind=MemberKind.SILL_PLATE,
                 position=(opening_left_x, sill_bottom_y),
                 size=(opening_width, DEFAULT_SILL_THICKNESS),
                 prerequisites=[left_jack_id, right_jack_id] + bottom_cripple_ids,
             ))
+            opening_member_ids[i].extend(bottom_cripple_ids + [sill_id])
 
         # 5. Header
         header_left_x = left_jack_x
@@ -566,6 +579,7 @@ def generate_panel(
             size=(header_width, DEFAULT_HEADER_DEPTH),
             prerequisites=[left_jack_id, right_jack_id],
         ))
+        opening_member_ids[i].append(header_id)
 
         # 6. Top cripples
         top_cripple_height = top_plate_y - header_top_y
@@ -585,6 +599,7 @@ def generate_panel(
             ))
             top_cripple_ids.append(cid)
         all_top_cripple_ids.extend(top_cripple_ids)
+        opening_member_ids[i].extend(top_cripple_ids)
 
     # ---- Common studs ---- #
     x_candidates = _common_stud_x_positions(wall_length, stud_spacing)
@@ -623,13 +638,11 @@ def generate_panel(
     # ---- OpeningSpec objects ---- #
     opening_specs: list[OpeningSpec] = []
     for i, (cx, op) in enumerate(zip(center_xs, sorted_openings)):
-        prefix = f"opening_{i}_"
-        opening_member_ids = [m.id for m in members if m.id.startswith(prefix)]
         opening_specs.append(OpeningSpec(
             kind=op["type"],   # type: ignore[arg-type]
             center_x=cx,
             width=op["width"],
-            member_ids=opening_member_ids,
+            member_ids=opening_member_ids[i],
         ))
 
     return Panel(
@@ -637,236 +650,6 @@ def generate_panel(
         wall_height=wall_height,
         members=members,
         openings=opening_specs,
-    )
-
-
-# ------------------------------------------------------------------ #
-# Legacy single-opening generator (unchanged — backwards compatible)   #
-# ------------------------------------------------------------------ #
-
-def generate_random_panel(
-    wall_length: float | None = None,
-    opening_type: Literal["window", "door"] = "window",
-    opening_center_x: float | None = None,
-    opening_width: float | None = None,
-    stud_spacing: float = DEFAULT_STUD_SPACING,
-    wall_height: float = DEFAULT_WALL_HEIGHT,
-    seed: int | None = None,
-) -> Panel:
-    """Generate a wall panel with one window or door opening.
-
-    All length arguments are in canonical units (see `framed.units`).
-    Members come back with prerequisites pre-stamped from physical
-    assembly rules:
-
-      - Bottom plate has no prereqs (placed first).
-      - Studs (common, king, jack) need the bottom plate.
-      - Header needs both jack studs.
-      - Sill (window) needs the jacks + the bottom cripples that
-        support it.
-      - Bottom cripples (window) need the bottom plate.
-      - Top cripples need the header.
-      - Top plate needs every full-height member underneath it
-        (common studs, king studs, top cripples).
-
-    Defaults: 8–14 ft wall, 8 ft tall, 16" OC studs, a 30–48" wide
-    opening roughly centered with some jitter, window with sill at 3 ft.
-    """
-    rng = random.Random(seed)
-
-    if wall_length is None:
-        wall_length = feet(rng.choice([8, 10, 12, 14]))
-    if opening_width is None:
-        opening_width = inches(rng.choice([30, 36, 42, 48]))
-
-    if opening_center_x is None:
-        # Keep the opening framing (king studs included) clear of the wall
-        # ends with at least 1 ft of margin to a wall edge.
-        margin = opening_width / 2 + 2 * LUMBER_THICKNESS + feet(1)
-        if margin * 2 > wall_length:
-            raise ValueError(
-                f"Wall too short ({wall_length}) for opening width "
-                f"{opening_width} with edge margin"
-            )
-        opening_center_x = rng.uniform(margin, wall_length - margin)
-
-    # Opening x bounds = inside-face-to-inside-face between jack studs
-    # (the rough opening width).
-    opening_left_x = opening_center_x - opening_width / 2
-    opening_right_x = opening_center_x + opening_width / 2
-
-    # y heights
-    top_plate_y = wall_height - LUMBER_THICKNESS
-    header_bottom_y = DEFAULT_HEADER_BOTTOM_Y
-    header_top_y = header_bottom_y + DEFAULT_HEADER_DEPTH
-    if header_top_y >= top_plate_y:
-        raise ValueError(
-            f"Header top ({header_top_y}) reaches top plate bottom "
-            f"({top_plate_y}); no room for top cripples"
-        )
-
-    if opening_type == "window":
-        sill_top_y = DEFAULT_SILL_TOP_Y
-        sill_bottom_y = sill_top_y - DEFAULT_SILL_THICKNESS
-        if sill_bottom_y <= LUMBER_THICKNESS:
-            raise ValueError(
-                f"Sill bottom ({sill_bottom_y}) at or below bottom plate "
-                f"top ({LUMBER_THICKNESS}); no room for bottom cripples"
-            )
-    else:
-        sill_top_y = None
-        sill_bottom_y = None
-
-    members: list[Member] = []
-
-    # 1. Bottom plate (no prereqs).
-    members.append(Member(
-        id="bottom_plate",
-        kind=MemberKind.BOTTOM_PLATE,
-        position=(0.0, 0.0),
-        size=(wall_length, LUMBER_THICKNESS),
-        prerequisites=[],
-    ))
-
-    # 2. King studs: full height, outside the jacks.
-    full_stud_height = top_plate_y - LUMBER_THICKNESS
-    left_king_x = opening_left_x - 2 * LUMBER_THICKNESS
-    right_king_x = opening_right_x + LUMBER_THICKNESS
-    members.append(Member(
-        id="left_king",
-        kind=MemberKind.KING_STUD,
-        position=(left_king_x, LUMBER_THICKNESS),
-        size=(LUMBER_THICKNESS, full_stud_height),
-        prerequisites=["bottom_plate"],
-    ))
-    members.append(Member(
-        id="right_king",
-        kind=MemberKind.KING_STUD,
-        position=(right_king_x, LUMBER_THICKNESS),
-        size=(LUMBER_THICKNESS, full_stud_height),
-        prerequisites=["bottom_plate"],
-    ))
-
-    # 3. Jack studs: inside the kings, support the header.
-    jack_height = header_bottom_y - LUMBER_THICKNESS
-    left_jack_x = opening_left_x - LUMBER_THICKNESS
-    right_jack_x = opening_right_x
-    members.append(Member(
-        id="left_jack",
-        kind=MemberKind.JACK_STUD,
-        position=(left_jack_x, LUMBER_THICKNESS),
-        size=(LUMBER_THICKNESS, jack_height),
-        prerequisites=["bottom_plate"],
-    ))
-    members.append(Member(
-        id="right_jack",
-        kind=MemberKind.JACK_STUD,
-        position=(right_jack_x, LUMBER_THICKNESS),
-        size=(LUMBER_THICKNESS, jack_height),
-        prerequisites=["bottom_plate"],
-    ))
-
-    # 4. Common studs: at stud_spacing intervals along the wall, skipping
-    # any whose footprint would collide with the opening framing region
-    # (the four studs from outside of left king to outside of right king).
-    opening_framing_left = left_king_x
-    opening_framing_right = right_king_x + LUMBER_THICKNESS
-    common_stud_ids: list[str] = []
-    x_candidates = _common_stud_x_positions(wall_length, stud_spacing)
-    for i, x in enumerate(x_candidates):
-        stud_left = x
-        stud_right = x + LUMBER_THICKNESS
-        if stud_right > opening_framing_left and stud_left < opening_framing_right:
-            # would overlap opening framing — skip
-            continue
-        cid = f"common_stud_{i}"
-        members.append(Member(
-            id=cid,
-            kind=MemberKind.COMMON_STUD,
-            position=(x, LUMBER_THICKNESS),
-            size=(LUMBER_THICKNESS, full_stud_height),
-            prerequisites=["bottom_plate"],
-        ))
-        common_stud_ids.append(cid)
-
-    # 5. Bottom cripples (window only): support the sill from below.
-    bottom_cripple_ids: list[str] = []
-    if opening_type == "window":
-        assert sill_bottom_y is not None
-        bot_cripple_height = sill_bottom_y - LUMBER_THICKNESS
-        for i, x in enumerate(_cripple_x_positions(
-            zone_left=opening_left_x,
-            zone_right=opening_right_x,
-            spacing=stud_spacing,
-        )):
-            cid = f"bottom_cripple_{i}"
-            members.append(Member(
-                id=cid,
-                kind=MemberKind.BOTTOM_CRIPPLE,
-                position=(x, LUMBER_THICKNESS),
-                size=(LUMBER_THICKNESS, bot_cripple_height),
-                prerequisites=["bottom_plate"],
-            ))
-            bottom_cripple_ids.append(cid)
-
-    # 6. Sill plate (window only): rests between jacks, on top of bottom
-    # cripples.
-    if opening_type == "window":
-        assert sill_top_y is not None and sill_bottom_y is not None
-        members.append(Member(
-            id="sill",
-            kind=MemberKind.SILL_PLATE,
-            position=(opening_left_x, sill_bottom_y),
-            size=(opening_width, DEFAULT_SILL_THICKNESS),
-            prerequisites=["left_jack", "right_jack"] + bottom_cripple_ids,
-        ))
-
-    # 7. Header: rests on the jacks, spans between the kings.
-    header_left_x = left_jack_x
-    header_width = (right_jack_x + LUMBER_THICKNESS) - left_jack_x
-    members.append(Member(
-        id="header",
-        kind=MemberKind.HEADER,
-        position=(header_left_x, header_bottom_y),
-        size=(header_width, DEFAULT_HEADER_DEPTH),
-        prerequisites=["left_jack", "right_jack"],
-    ))
-
-    # 8. Top cripples: rest on the header, support the top plate.
-    top_cripple_ids: list[str] = []
-    top_cripple_height = top_plate_y - header_top_y
-    for i, x in enumerate(_cripple_x_positions(
-        zone_left=header_left_x,
-        zone_right=header_left_x + header_width,
-        spacing=stud_spacing,
-    )):
-        cid = f"top_cripple_{i}"
-        members.append(Member(
-            id=cid,
-            kind=MemberKind.TOP_CRIPPLE,
-            position=(x, header_top_y),
-            size=(LUMBER_THICKNESS, top_cripple_height),
-            prerequisites=["header"],
-        ))
-        top_cripple_ids.append(cid)
-
-    # 9. Top plate: every full-height member that touches its bottom is
-    # a prerequisite.
-    top_plate_deps = (
-        ["left_king", "right_king"] + common_stud_ids + top_cripple_ids
-    )
-    members.append(Member(
-        id="top_plate",
-        kind=MemberKind.TOP_PLATE,
-        position=(0.0, top_plate_y),
-        size=(wall_length, LUMBER_THICKNESS),
-        prerequisites=top_plate_deps,
-    ))
-
-    return Panel(
-        wall_length=wall_length,
-        wall_height=wall_height,
-        members=members,
     )
 
 

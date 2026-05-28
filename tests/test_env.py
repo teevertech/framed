@@ -19,18 +19,21 @@ Two test fixtures:
 * ``_simple_panel()`` — a hand-built 3-member panel (bottom plate → stud →
   top plate) with strict ordering. Used wherever an exact expected reward
   or sequence matters.
-* ``generate_random_panel(seed=...)`` — used for broader integration
-  checks where structure (not exact numbers) is what we're testing.
+* ``generate_panel(...)`` — used for broader integration checks where
+  structure (not exact numbers) is what we're testing.
 
-Observation layout (post-padding refactor)
-------------------------------------------
-Total obs dim = 2 + 13 * MAX_MEMBERS = 652.
+Observation layout (803-element flat vector)
+--------------------------------------------
+Total obs dim = 3 + 16 * MAX_MEMBERS = 803.
 
   [0:2]                      normalised robot position
   [2 : 2+MAX]                placed flags (real members; padding = 0)
   [2+MAX : 2+3*MAX]          normalised centers, x/y interleaved (padding = 0)
-  [2+3*MAX : 2+12*MAX]       kind one-hots, 9 classes (padding = 0)
-  [2+12*MAX : 2+13*MAX]      prereq-satisfied flags (padding = 0)
+  [2+3*MAX : 2+5*MAX]        normalised member sizes, w/h interleaved (padding = 0)
+  [2+5*MAX : 2+14*MAX]       kind one-hots, 9 classes × MAX_MEMBERS (padding = 0)
+  [2+14*MAX : 2+15*MAX]      prereq-satisfied flags (padding = 0)
+  [2+15*MAX : 2+16*MAX]      robot-to-member distances / wall diagonal (padding = 0)
+  [2+16*MAX]                 progress — fraction of members placed
 """
 from __future__ import annotations
 
@@ -41,17 +44,15 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 
-from framed.env import MAX_MEMBERS, PanelEnv, RandomPanelEnv
+from framed.env import MAX_MEMBERS, OBS_DIM, PanelEnv, RandomPanelEnv
 from framed.panel import (
     LUMBER_THICKNESS,
     Member,
     MemberKind,
     Panel,
-    generate_random_panel,
+    generate_panel,
 )
 from framed.units import feet, inches
-
-OBS_DIM = 2 + 13 * MAX_MEMBERS  # 652
 
 
 # ===================================================================== #
@@ -195,10 +196,11 @@ class TestInit:
         assert env.action_space.n == MAX_MEMBERS
 
     def test_observation_space_shape(self) -> None:
-        """Obs dim = 2 + 13 * MAX_MEMBERS = 652, regardless of panel size.
+        """Obs dim = 3 + 16 * MAX_MEMBERS = 803, regardless of panel size.
 
         Sections: robot pos (2) | placed flags (MAX) | centers (2*MAX) |
-                  kind one-hots (9*MAX) | prereq flags (MAX).
+                  sizes (2*MAX) | kind one-hots (9*MAX) | prereq flags (MAX) |
+                  distances (MAX) | progress (1).
         """
         env = PanelEnv(_simple_panel())
         assert isinstance(env.observation_space, spaces.Box)
@@ -210,7 +212,11 @@ class TestInit:
     def test_obs_shape_fixed_regardless_of_panel_size(self) -> None:
         """Panels of any member count must produce the same obs space shape."""
         for seed in range(5):
-            panel = generate_random_panel(seed=seed)
+            panel = generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            )
             env = PanelEnv(panel)
             assert env.observation_space.shape == (OBS_DIM,)
 
@@ -475,7 +481,11 @@ class TestActionMasks:
         must raise.  (We test the latter only for already-placed
         members; for unplaced-with-unmet-prereqs we'd need a more
         careful copy of state.)"""
-        panel = generate_random_panel(seed=7)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=7,
+        )
         env = PanelEnv(panel)
         env.reset()
 
@@ -585,7 +595,11 @@ class TestRewardComputation:
         """At episode start nothing is placed, so the path can't hit any
         member — collided must be False for the first step."""
         for seed in range(5):
-            env = PanelEnv(generate_random_panel(seed=seed))
+            env = PanelEnv(generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            ))
             env.reset()
             mask = env.action_masks()
             first = int(np.flatnonzero(mask)[0])
@@ -695,7 +709,11 @@ class TestObservation:
 
     def test_member_centers_in_unit_box(self) -> None:
         """For any panel, every normalised center should be in [0, 1]."""
-        env = PanelEnv(generate_random_panel(seed=3))
+        env = PanelEnv(generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=3,
+        ))
         obs, _ = env.reset()
         n = env.n_members
         centers = obs[2 + MAX_MEMBERS : 2 + MAX_MEMBERS + n * 2]
@@ -704,7 +722,7 @@ class TestObservation:
 
     def test_kind_onehots_section(self) -> None:
         """Each real member's 9-element one-hot sits at the right offset
-        in obs[2+3*MAX : 2+12*MAX].
+        in obs[2+5*MAX : 2+14*MAX].
 
         Kind indices (alphabetical):
           0 bottom_cripple | 1 bottom_plate | 2 common_stud | 3 header |
@@ -714,7 +732,7 @@ class TestObservation:
         panel = _simple_panel()  # bot=BOTTOM_PLATE(1), stud=COMMON_STUD(2), top=TOP_PLATE(8)
         env = PanelEnv(panel)
         obs, _ = env.reset()
-        base = 2 + 3 * MAX_MEMBERS
+        base = 2 + 5 * MAX_MEMBERS
 
         # bot (member 0) → BOTTOM_PLATE → kind index 1
         bot_onehot = obs[base : base + 9]
@@ -741,17 +759,17 @@ class TestObservation:
         env = PanelEnv(_simple_panel())
         obs, _ = env.reset()
         n = env.n_members
-        base = 2 + 12 * MAX_MEMBERS
+        base = 2 + 14 * MAX_MEMBERS
         assert obs[base + 0] == pytest.approx(1.0)   # bot unlocked
         assert obs[base + 1] == pytest.approx(0.0)   # stud locked
         assert obs[base + 2] == pytest.approx(0.0)   # top locked
-        assert np.all(obs[base + n :] == 0.0)         # padding
+        assert np.all(obs[base + n : base + MAX_MEMBERS] == 0.0)  # padding
 
     def test_prereq_satisfied_flags_update_after_step(self) -> None:
         """Placing bot unlocks stud; placing stud unlocks top."""
         env = PanelEnv(_simple_panel())
         env.reset()
-        base = 2 + 12 * MAX_MEMBERS
+        base = 2 + 14 * MAX_MEMBERS
 
         obs, _, _, _, _ = env.step(0)   # place bot
         assert obs[base + 1] == pytest.approx(1.0)   # stud now unlocked
@@ -761,7 +779,11 @@ class TestObservation:
         assert obs[base + 2] == pytest.approx(1.0)   # top now unlocked
 
     def test_obs_stays_in_observation_space_through_episode(self) -> None:
-        env = PanelEnv(generate_random_panel(seed=11))
+        env = PanelEnv(generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=11,
+        ))
         obs, _ = env.reset()
         assert env.observation_space.contains(obs)
         for action in _topo_order_indices(env):
@@ -776,10 +798,14 @@ class TestObservation:
 class TestPaddedObsActionSpace:
     """Verify the fixed-size padded space invariants introduced by MAX_MEMBERS."""
 
-    def test_obs_shape_is_always_652(self) -> None:
-        """Obs shape is (652,) for any panel regardless of member count."""
+    def test_obs_shape_is_always_803(self) -> None:
+        """Obs shape is (803,) for any panel regardless of member count."""
         for seed in range(5):
-            panel = generate_random_panel(seed=seed)
+            panel = generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            )
             env = PanelEnv(panel)
             obs, _ = env.reset()
             assert obs.shape == (OBS_DIM,), (
@@ -788,7 +814,11 @@ class TestPaddedObsActionSpace:
 
     def test_action_space_is_always_max_members(self) -> None:
         for seed in range(5):
-            env = PanelEnv(generate_random_panel(seed=seed))
+            env = PanelEnv(generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            ))
             assert env.action_space.n == MAX_MEMBERS
 
     def test_padding_slots_in_mask_are_always_false(self) -> None:
@@ -819,25 +849,45 @@ class TestPaddedObsActionSpace:
         base = 2 + MAX_MEMBERS
         assert np.all(obs[base + n * 2 : base + MAX_MEMBERS * 2] == 0.0)
 
-    def test_padding_slots_zero_in_onehots_section(self) -> None:
-        """Kind one-hots padding: obs[2+3*MAX+n*9 : 2+12*MAX] must be 0."""
+    def test_padding_slots_zero_in_sizes_section(self) -> None:
+        """Sizes section padding: obs[2+3*MAX+n*2 : 2+5*MAX] must be 0."""
         env = PanelEnv(_simple_panel())
         obs, _ = env.reset()
         n = env.n_members
         base = 2 + 3 * MAX_MEMBERS
-        assert np.all(obs[base + n * 9 : base + MAX_MEMBERS * 9] == 0.0)
+        assert np.all(obs[base + n * 2 : base + MAX_MEMBERS * 2] == 0.0)
 
-    def test_padding_slots_zero_in_prereq_section(self) -> None:
-        """Prereq flags padding: obs[2+12*MAX+n : 2+13*MAX] must be 0."""
+    def test_padding_slots_zero_in_onehots_section(self) -> None:
+        """Kind one-hots padding: obs[2+5*MAX+n*9 : 2+14*MAX] must be 0."""
         env = PanelEnv(_simple_panel())
         obs, _ = env.reset()
         n = env.n_members
-        base = 2 + 12 * MAX_MEMBERS
-        assert np.all(obs[base + n :] == 0.0)
+        base = 2 + 5 * MAX_MEMBERS
+        assert np.all(obs[base + n * 9 : base + MAX_MEMBERS * 9] == 0.0)
+
+    def test_padding_slots_zero_in_prereq_section(self) -> None:
+        """Prereq flags padding: obs[2+14*MAX+n : 2+15*MAX] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + 14 * MAX_MEMBERS
+        assert np.all(obs[base + n : base + MAX_MEMBERS] == 0.0)
+
+    def test_padding_slots_zero_in_distances_section(self) -> None:
+        """Distances section padding: obs[2+15*MAX+n : 2+16*MAX] must be 0."""
+        env = PanelEnv(_simple_panel())
+        obs, _ = env.reset()
+        n = env.n_members
+        base = 2 + 15 * MAX_MEMBERS
+        assert np.all(obs[base + n : base + MAX_MEMBERS] == 0.0)
 
     def test_padding_slots_remain_zero_through_episode(self) -> None:
         """All padding sections stay zero across every step of a full episode."""
-        env = PanelEnv(generate_random_panel(seed=5))
+        env = PanelEnv(generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=5,
+        ))
         obs, _ = env.reset()
         n = env.n_members
 
@@ -845,10 +895,14 @@ class TestPaddedObsActionSpace:
             assert np.all(obs[2 + n : 2 + MAX_MEMBERS] == 0.0), "placed padding"
             base_c = 2 + MAX_MEMBERS
             assert np.all(obs[base_c + n * 2 : base_c + MAX_MEMBERS * 2] == 0.0), "centers padding"
-            base_k = 2 + 3 * MAX_MEMBERS
+            base_s = 2 + 3 * MAX_MEMBERS
+            assert np.all(obs[base_s + n * 2 : base_s + MAX_MEMBERS * 2] == 0.0), "sizes padding"
+            base_k = 2 + 5 * MAX_MEMBERS
             assert np.all(obs[base_k + n * 9 : base_k + MAX_MEMBERS * 9] == 0.0), "onehots padding"
-            base_p = 2 + 12 * MAX_MEMBERS
-            assert np.all(obs[base_p + n :] == 0.0), "prereq padding"
+            base_p = 2 + 14 * MAX_MEMBERS
+            assert np.all(obs[base_p + n : base_p + MAX_MEMBERS] == 0.0), "prereq padding"
+            base_d = 2 + 15 * MAX_MEMBERS
+            assert np.all(obs[base_d + n : base_d + MAX_MEMBERS] == 0.0), "distances padding"
 
         _check_padding(obs)
         for action in _topo_order_indices(env):
@@ -878,7 +932,11 @@ class TestFullEpisode:
     def test_random_panel_runs_to_completion(self, seed: int) -> None:
         """Across many seeds, following any topological order produces a
         valid full episode."""
-        panel = generate_random_panel(seed=seed)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=seed,
+        )
         env = PanelEnv(panel)
         env.reset()
         order = _topo_order_indices(env)
@@ -893,7 +951,11 @@ class TestFullEpisode:
     def test_cumulative_reward_is_finite_and_negative(self) -> None:
         """Sanity: every step has reward ≤ 0, so total reward should be
         finite and ≤ 0."""
-        env = PanelEnv(generate_random_panel(seed=2))
+        env = PanelEnv(generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=2,
+        ))
         env.reset()
         total = 0.0
         for action in _topo_order_indices(env):
@@ -912,7 +974,11 @@ class TestDeterminism:
     def test_same_actions_same_rewards(self) -> None:
         """Two envs with the same panel and same action sequence must
         produce identical reward trajectories."""
-        panel = generate_random_panel(seed=4)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=4,
+        )
         env_a = PanelEnv(panel)
         env_b = PanelEnv(panel)
         env_a.reset()
@@ -924,7 +990,11 @@ class TestDeterminism:
             assert ra == rb
 
     def test_same_actions_same_observations(self) -> None:
-        panel = generate_random_panel(seed=8)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=8,
+        )
         env_a = PanelEnv(panel)
         env_b = PanelEnv(panel)
         obs_a, _ = env_a.reset()
@@ -945,7 +1015,11 @@ class TestRandomPanelEnv:
     of any member count across resets — padding handles the variable sizes."""
 
     def test_obs_and_action_space_are_max_members_sized(self) -> None:
-        panels = [generate_random_panel(seed=s) for s in range(3)]
+        panels = [generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=s,
+        ) for s in range(3)]
         it = iter(panels)
         env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
         assert env.observation_space.shape == (OBS_DIM,)
@@ -953,7 +1027,11 @@ class TestRandomPanelEnv:
 
     def test_spaces_do_not_change_across_resets(self) -> None:
         """The space objects are created once at init and must not mutate."""
-        panels = [generate_random_panel(seed=s) for s in range(6)]
+        panels = [generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=s,
+        ) for s in range(6)]
         it = iter(panels)
         env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
         obs_space_id = id(env.observation_space)
@@ -966,9 +1044,18 @@ class TestRandomPanelEnv:
     def test_accepts_panels_of_different_member_counts(self) -> None:
         """reset() must not raise when successive panels have different
         member counts — padding absorbs the difference."""
-        panel_window = generate_random_panel(opening_type="window", seed=0)
-        panel_door   = generate_random_panel(opening_type="door",   seed=0)
-        # Window has more members (sill + bottom cripples) than door.
+        # A window panel has more members (sill + bottom cripples) than
+        # the equivalent door panel.
+        panel_window = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        panel_door = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
         assert len(panel_window.members) != len(panel_door.members)
 
         # RandomPanelEnv.__init__ calls panel_generator() once to build the
@@ -986,8 +1073,16 @@ class TestRandomPanelEnv:
     def test_each_reset_produces_obs_in_observation_space(self) -> None:
         # RandomPanelEnv.__init__ calls the generator once, so we need
         # len(panels) + 1 entries: one for __init__ and one per reset call.
-        panels = [generate_random_panel(seed=s) for s in range(5)]
-        it = iter([generate_random_panel(seed=99)] + panels)
+        panels = [generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=s,
+        ) for s in range(5)]
+        it = iter([generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=99,
+        )] + panels)
         env = RandomPanelEnv(lambda: next(it), robot_speed=10.0)
         for _ in panels:
             obs, _ = env.reset()

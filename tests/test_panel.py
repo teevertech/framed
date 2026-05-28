@@ -1,15 +1,11 @@
-"""Tests for the panel data model and random generator.
+"""Tests for the panel data model and generator.
 
-These pin down the invariants ``Panel`` enforces (unique ids, in-bounds,
-acyclic prereqs, no overlaps), plus the behaviour of ``generate_random_panel``
-(deterministic by seed, all members valid, prereqs form a complete DAG
-that orders every member).
+``TestMember`` and ``TestPanelValidation`` pin down the invariants ``Panel``
+enforces: unique ids, in-bounds, acyclic prereqs, and no overlapping footprints.
 
-``TestGeneratePanel`` covers the new ``generate_panel`` function: multi-opening
-support, namespaced member IDs (``opening_i_*``), split bottom plates for
-doors, ``OpeningSpec`` metadata, and the wall-length / placement-fit guards.
-The existing ``generate_random_panel`` tests are preserved unchanged — that
-function's API and output format are frozen for backwards compatibility.
+``TestGeneratePanel`` covers ``generate_panel``: multi-opening support,
+namespaced member IDs (``opening_i_*``), split bottom plates for doors,
+``OpeningSpec`` metadata, and the wall-length / placement-fit guards.
 """
 from __future__ import annotations
 
@@ -32,7 +28,6 @@ from framed.panel import (
     OpeningSpec,
     Panel,
     generate_panel,
-    generate_random_panel,
 )
 from framed.units import feet, inches
 
@@ -210,139 +205,9 @@ class TestPanelValidation:
         assert len(panel.members) == 3
 
 
-# ===================================================================== #
-# generate_random_panel (legacy function — frozen API)                  #
-# ===================================================================== #
-
-class TestGenerator:
-    def test_default_generation_produces_valid_panel(self) -> None:
-        panel = generate_random_panel(seed=0)
-        # Panel construction itself validates; reaching here is the test.
-        assert isinstance(panel, Panel)
-        assert panel.wall_length > 0
-        assert panel.wall_height > 0
-        assert len(panel.members) >= 6  # at minimum: 2 plates + 2 kings + 2 jacks
-
-    def test_same_seed_produces_same_panel(self) -> None:
-        a = generate_random_panel(seed=42)
-        b = generate_random_panel(seed=42)
-        assert a.wall_length == b.wall_length
-        assert len(a.members) == len(b.members)
-        for ma, mb in zip(a.members, b.members):
-            assert ma.id == mb.id
-            assert ma.position == mb.position
-            assert ma.size == mb.size
-            assert ma.prerequisites == mb.prerequisites
-
-    def test_different_seeds_produce_different_panels(self) -> None:
-        seeds_seen: set[tuple[float, int]] = set()
-        for s in range(10):
-            p = generate_random_panel(seed=s)
-            seeds_seen.add((p.wall_length, len(p.members)))
-        # Across 10 seeds we should see variation
-        assert len(seeds_seen) > 1
-
-    def test_window_has_sill_and_bottom_cripples(self) -> None:
-        panel = generate_random_panel(opening_type="window", seed=0)
-        kinds = {m.kind for m in panel.members}
-        assert MemberKind.SILL_PLATE in kinds
-        assert MemberKind.BOTTOM_CRIPPLE in kinds
-
-    def test_door_has_no_sill_or_bottom_cripples(self) -> None:
-        panel = generate_random_panel(opening_type="door", seed=0)
-        kinds = {m.kind for m in panel.members}
-        assert MemberKind.SILL_PLATE not in kinds
-        assert MemberKind.BOTTOM_CRIPPLE not in kinds
-
-    def test_every_panel_has_one_top_and_bottom_plate(self) -> None:
-        panel = generate_random_panel(seed=0)
-        n_top = sum(1 for m in panel.members if m.kind == MemberKind.TOP_PLATE)
-        n_bot = sum(1 for m in panel.members if m.kind == MemberKind.BOTTOM_PLATE)
-        assert n_top == 1
-        assert n_bot == 1
-
-    def test_kings_and_jacks_come_in_pairs(self) -> None:
-        panel = generate_random_panel(seed=0)
-        n_king = sum(1 for m in panel.members if m.kind == MemberKind.KING_STUD)
-        n_jack = sum(1 for m in panel.members if m.kind == MemberKind.JACK_STUD)
-        assert n_king == 2
-        assert n_jack == 2
-
-    def test_explicit_parameters(self) -> None:
-        panel = generate_random_panel(
-            wall_length=feet(10),
-            opening_type="window",
-            opening_center_x=feet(5),
-            opening_width=inches(36),
-            seed=0,
-        )
-        assert panel.wall_length == feet(10)
-        # Header should span 36" + 2 jack thicknesses
-        header = next(m for m in panel.members if m.kind == MemberKind.HEADER)
-        assert header.size[0] == pytest.approx(inches(36) + 2 * LUMBER_THICKNESS)
-
-    def test_prereqs_form_complete_topological_order(self) -> None:
-        """Every member must be placeable in some order respecting prereqs,
-        and that order must include all members. This is the basic property
-        the env relies on."""
-        for seed in range(20):
-            panel = generate_random_panel(seed=seed)
-            order = _topological_order(panel)
-            assert len(order) == len(panel.members), (
-                f"Seed {seed}: only {len(order)}/{len(panel.members)} members "
-                f"orderable — prereqs incomplete or cyclic"
-            )
-
-    def test_top_plate_depends_on_all_full_height_members(self) -> None:
-        panel = generate_random_panel(seed=0)
-        top_plate = next(m for m in panel.members if m.kind == MemberKind.TOP_PLATE)
-        prereq_set = set(top_plate.prerequisites)
-
-        # Every common stud, king stud, and top cripple must be a prereq
-        for m in panel.members:
-            if m.kind in (
-                MemberKind.COMMON_STUD,
-                MemberKind.KING_STUD,
-                MemberKind.TOP_CRIPPLE,
-            ):
-                assert m.id in prereq_set, (
-                    f"top_plate missing prereq on {m.kind.value} {m.id}"
-                )
-
-    def test_header_depends_on_both_jacks(self) -> None:
-        panel = generate_random_panel(seed=0)
-        header = next(m for m in panel.members if m.kind == MemberKind.HEADER)
-        assert "left_jack" in header.prerequisites
-        assert "right_jack" in header.prerequisites
-
-    def test_sill_depends_on_jacks_and_bottom_cripples(self) -> None:
-        panel = generate_random_panel(opening_type="window", seed=0)
-        sill = next(m for m in panel.members if m.kind == MemberKind.SILL_PLATE)
-        assert "left_jack" in sill.prerequisites
-        assert "right_jack" in sill.prerequisites
-        bottom_cripple_ids = [
-            m.id for m in panel.members if m.kind == MemberKind.BOTTOM_CRIPPLE
-        ]
-        for bid in bottom_cripple_ids:
-            assert bid in sill.prerequisites
-
-    def test_top_cripples_depend_on_header(self) -> None:
-        panel = generate_random_panel(seed=0)
-        for m in panel.members:
-            if m.kind == MemberKind.TOP_CRIPPLE:
-                assert "header" in m.prerequisites
-
-    @pytest.mark.parametrize("opening_type", ["window", "door"])
-    def test_robust_across_many_seeds(self, opening_type: str) -> None:
-        """Smoke test: generator should not raise across many seeds and
-        the resulting panels should validate."""
-        for seed in range(50):
-            panel = generate_random_panel(opening_type=opening_type, seed=seed)  # type: ignore[arg-type]
-            assert len(panel.members) >= 6
-
 
 # ===================================================================== #
-# generate_panel (new multi-opening function)                           #
+# generate_panel                                                         #
 # ===================================================================== #
 
 class TestGeneratePanel:
@@ -654,7 +519,54 @@ class TestGeneratePanel:
         for mid in spec.member_ids:
             assert mid in panel_ids, f"OpeningSpec references unknown id '{mid}'"
 
-    def test_two_openings_spec_sorted_by_center_x(self) -> None:
+    def test_opening_spec_member_ids_include_plate_segments(self) -> None:
+        """OpeningSpec.member_ids must include the bottom plate segment(s) that
+        support the opening's framing — the fix for the post-hoc prefix-filter
+        bug that silently excluded plates.
+
+        For a door panel the plate is split, so each spec should reference at
+        least one plate segment.  For a window panel the single bottom plate
+        is referenced by both specs (kings on each side both sit on it).
+        """
+        # Door: split plate — each opening's framing sits on a distinct segment.
+        door_panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "door", "width": inches(36)}],
+            seed=0,
+        )
+        plate_ids = {m.id for m in door_panel.members if m.kind == MemberKind.BOTTOM_PLATE}
+        assert plate_ids, "expected at least one bottom plate segment"
+        spec = door_panel.openings[0]
+        assert any(pid in spec.member_ids for pid in plate_ids), (
+            "OpeningSpec.member_ids missing bottom plate segment for door opening"
+        )
+
+        # Window: single plate shared by both sides — must appear in member_ids.
+        window_panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=0,
+        )
+        assert "bottom_plate" in window_panel.openings[0].member_ids, (
+            "OpeningSpec.member_ids missing 'bottom_plate' for window opening"
+        )
+
+    def test_opening_spec_member_ids_are_valid_panel_members(self) -> None:
+        """Every id in every OpeningSpec must resolve to a real panel member."""
+        panel = generate_panel(
+            wall_length=feet(16),
+            openings=[
+                {"type": "window", "width": inches(24)},
+                {"type": "door",   "width": inches(32)},
+            ],
+            seed=3,
+        )
+        panel_ids = {m.id for m in panel.members}
+        for i, spec in enumerate(panel.openings):
+            for mid in spec.member_ids:
+                assert mid in panel_ids, (
+                    f"OpeningSpec[{i}] references unknown member id '{mid}'"
+                )
         """OpeningSpec entries are ordered by center_x (left to right)."""
         panel = generate_panel(
             wall_length=feet(16),
@@ -667,8 +579,15 @@ class TestGeneratePanel:
         assert len(panel.openings) == 2
         assert panel.openings[0].center_x < panel.openings[1].center_x
 
-    def test_opening_spec_member_ids_prefixed(self) -> None:
-        """All member IDs in each OpeningSpec should carry the matching prefix."""
+    def test_opening_spec_member_ids_complete(self) -> None:
+        """All structural members belonging to each opening are captured in
+        member_ids, including the supporting plate segment(s).
+
+        Prefixed members (kings, jacks, header, cripples, sill) must carry
+        the matching ``opening_i_`` prefix.  Plate segments are shared
+        infrastructure and use their own naming scheme (``bottom_plate``,
+        ``bottom_plate_0``, etc.).
+        """
         panel = generate_panel(
             wall_length=feet(16),
             openings=[
@@ -677,11 +596,20 @@ class TestGeneratePanel:
             ],
             seed=0,
         )
+        plate_ids = {m.id for m in panel.members if m.kind == MemberKind.BOTTOM_PLATE}
         for i, spec in enumerate(panel.openings):
+            prefix = f"opening_{i}_"
             for mid in spec.member_ids:
-                assert mid.startswith(f"opening_{i}_"), (
-                    f"OpeningSpec[{i}] contains id '{mid}' without expected prefix"
+                # Every id must exist in the panel.
+                panel_ids = {m.id for m in panel.members}
+                assert mid in panel_ids, (
+                    f"OpeningSpec[{i}] references unknown id '{mid}'"
                 )
+                # Ids that aren't plate segments must carry the opening prefix.
+                if mid not in plate_ids:
+                    assert mid.startswith(prefix), (
+                        f"OpeningSpec[{i}] non-plate id '{mid}' missing prefix '{prefix}'"
+                    )
 
     # ------------------------------------------------------------------ #
     # Topological completeness                                             #

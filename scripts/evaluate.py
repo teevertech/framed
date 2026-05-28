@@ -1,20 +1,14 @@
-"""Evaluate trained models across many panels and panel types.
+"""Evaluate trained models across many panels.
 
 Produces a summary table and optional per-panel GIFs showing how a
 trained policy compares to greedy baselines on panels it has never seen.
 
 Usage
 -----
-Evaluate the portfolio_k4.0 model on 20 random panels (same topology)::
+Evaluate on 20 unseen panels (sampled from the training distribution)::
 
     python scripts/evaluate.py \
         --model checkpoints/portfolio_k4.0/final_model.zip
-
-Cross-topology evaluation (window + door + different widths)::
-
-    python scripts/evaluate.py \
-        --model checkpoints/portfolio_k4.0/final_model.zip \
-        --cross-topology
 
 Save GIFs of the best and worst episodes::
 
@@ -39,8 +33,6 @@ import numpy as np
 from framed.baselines import greedy_cost_aware_action, greedy_nearest_action, run_episode
 from framed.config import TrainConfig
 from framed.env import PanelEnv
-from framed.panel import generate_random_panel
-from framed.units import feet, inches
 
 
 # ------------------------------------------------------------------ #
@@ -50,7 +42,11 @@ from framed.units import feet, inches
 def _make_same_topology_panels(
     config: TrainConfig, n: int, seed_offset: int = 50_000,
 ) -> list[tuple[str, PanelEnv]]:
-    """Generate panels with the same topology as training."""
+    """Generate *n* evaluation panels from the training distribution.
+
+    Uses ``config.make_panel_generator`` with a seed offset well outside
+    the training range so these panels are genuinely unseen.
+    """
     gen = config.make_panel_generator(seed=seed_offset)
     panels = []
     for i in range(n):
@@ -60,63 +56,7 @@ def _make_same_topology_panels(
             robot_speed=config.robot_speed,
             collision_penalty_multiplier=config.collision_penalty_multiplier,
         )
-        panels.append((f"same_topo_{i:03d}", env))
-    return panels
-
-
-def _make_cross_topology_panels(
-    config: TrainConfig, target_n: int, seed_base: int = 70_000,
-) -> list[tuple[str, PanelEnv]]:
-    """Generate panels with different topologies to test generalisation.
-
-    Only includes variants whose member count matches *target_n* (derived
-    from the model's observation space).  Variants that don't match are
-    skipped with a note — this is a fundamental limitation of fixed-size
-    observation spaces, not a bug.
-    """
-    panels: list[tuple[str, PanelEnv]] = []
-    skipped: list[str] = []
-
-    variants: list[tuple[str, dict]] = [
-        # Different opening widths
-        ("window_24in",  dict(opening_type="window", opening_width=inches(24),  wall_length=config.wall_length)),
-        ("window_30in",  dict(opening_type="window", opening_width=inches(30),  wall_length=config.wall_length)),
-        ("window_42in",  dict(opening_type="window", opening_width=inches(42),  wall_length=config.wall_length)),
-        ("window_48in",  dict(opening_type="window", opening_width=inches(48),  wall_length=config.wall_length)),
-        # Different wall lengths
-        ("wall_10ft",    dict(opening_type="window", opening_width=config.opening_width, wall_length=feet(10))),
-        ("wall_14ft",    dict(opening_type="window", opening_width=config.opening_width, wall_length=feet(14))),
-        ("wall_16ft",    dict(opening_type="window", opening_width=config.opening_width, wall_length=feet(16))),
-        ("wall_20ft",    dict(opening_type="window", opening_width=config.opening_width, wall_length=feet(20))),
-        # Door instead of window
-        ("door_32in",    dict(opening_type="door",   opening_width=inches(32),  wall_length=config.wall_length)),
-        ("door_36in",    dict(opening_type="door",   opening_width=inches(36),  wall_length=config.wall_length)),
-    ]
-
-    for name, kwargs in variants:
-        found = False
-        best_n = None
-        for seed in range(seed_base, seed_base + 50):
-            panel = generate_random_panel(seed=seed, **kwargs)
-            best_n = len(panel.members)
-            if best_n == target_n:
-                env = PanelEnv(
-                    panel,
-                    robot_speed=config.robot_speed,
-                    collision_penalty_multiplier=config.collision_penalty_multiplier,
-                )
-                panels.append((name, env))
-                found = True
-                break
-        if not found:
-            skipped.append(f"{name} ({best_n} members, model expects {target_n})")
-
-    if skipped:
-        print(f"\nSkipped {len(skipped)} variant(s) (incompatible member count):")
-        for s in skipped:
-            print(f"  - {s}")
-        print("  (This is expected — the model's observation space is fixed-size.)")
-
+        panels.append((f"panel_{i:03d}", env))
     return panels
 
 
@@ -266,9 +206,7 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--model", required=True,
                    help="Path to MaskablePPO .zip file")
     p.add_argument("--n-panels", type=int, default=20,
-                   help="Number of same-topology panels to test (default: 20)")
-    p.add_argument("--cross-topology", action="store_true",
-                   help="Also test on different wall lengths, doors, etc.")
+                   help="Number of panels to evaluate (default: 20)")
     p.add_argument("--collision-penalty", type=float, default=None,
                    help="Override collision penalty (default: use training default)")
     p.add_argument("--save-gifs", default=None,
@@ -286,35 +224,21 @@ def main() -> None:
         )
 
     # Derive target member count from the model's observation space.
-    # obs shape = 2 + 3*n_members → n_members = (obs_dim - 2) / 3
+    # obs shape = 3 + 16*MAX_MEMBERS — used only for the console message.
     from sb3_contrib import MaskablePPO
     model = MaskablePPO.load(args.model)
     obs_dim = model.observation_space.shape[0]
-    target_n = (obs_dim - 2) // 3
-    print(f"Model expects {target_n}-member panels (obs dim = {obs_dim})")
+    print(f"Model loaded  (obs dim = {obs_dim})")
     del model  # free memory; evaluate_model reloads it
 
-    # Same-topology evaluation
-    same_panels = _make_same_topology_panels(config, n=args.n_panels)
-    same_results = evaluate_model(args.model, same_panels, config)
-    print_results(same_results, "Same Topology (training distribution)")
-
-    # Cross-topology evaluation
-    cross_panels = []
-    cross_results = []
-    if args.cross_topology:
-        cross_panels = _make_cross_topology_panels(config, target_n=target_n)
-        if cross_panels:
-            cross_results = evaluate_model(args.model, cross_panels, config)
-            print_results(cross_results, "Cross Topology (unseen panel types)")
-        else:
-            print("\nNo cross-topology panels could be generated with matching member count.")
+    # Evaluation panels — seeded outside the training range.
+    panels = _make_same_topology_panels(config, n=args.n_panels)
+    results = evaluate_model(args.model, panels, config)
+    print_results(results, f"Evaluation — {args.n_panels} unseen panels")
 
     # GIFs
     if args.save_gifs:
-        all_panels  = same_panels  + cross_panels
-        all_results = same_results + cross_results
-        save_eval_gifs(args.model, all_results, all_panels, args.save_gifs)
+        save_eval_gifs(args.model, results, panels, args.save_gifs)
 
 
 if __name__ == "__main__":

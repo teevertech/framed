@@ -37,7 +37,7 @@ from framed.panel import (
     Member,
     MemberKind,
     Panel,
-    generate_random_panel,
+    generate_panel,
 )
 from framed.units import feet, inches
 
@@ -235,7 +235,11 @@ class TestGreedyNearestAction:
 
     @pytest.mark.parametrize("seed", list(range(10)))
     def test_runs_full_episode_random_panel(self, seed: int) -> None:
-        panel = generate_random_panel(seed=seed)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=seed,
+        )
         env = PanelEnv(panel)
         total, infos = run_episode(env, greedy_nearest_action)
         assert len(infos) == env.n_members
@@ -252,7 +256,11 @@ class TestGreedyCostAwareAction:
         """With nothing placed, there can be no collisions, so cost-aware
         and nearest should agree (both pick the closest valid member)."""
         for seed in range(5):
-            panel = generate_random_panel(seed=seed)
+            panel = generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            )
             env_n = PanelEnv(panel)
             env_c = PanelEnv(panel)
             env_n.reset()
@@ -317,7 +325,7 @@ class TestGreedyCostAwareAction:
     def test_matches_nearest_when_penalty_is_zero(self) -> None:
         """With k=0, the cost function is pure travel time — identical to
         nearest.  Both should agree at every step."""
-        panel = generate_random_panel(seed=5)
+        panel = generate_panel(wall_length=feet(12), openings=[{"type": "window", "width": inches(36)}], seed=5)
         env_n = PanelEnv(panel, collision_penalty_multiplier=0.0)
         env_c = PanelEnv(panel, collision_penalty_multiplier=0.0)
         env_n.reset()
@@ -339,7 +347,11 @@ class TestGreedyCostAwareAction:
 
     @pytest.mark.parametrize("seed", list(range(10)))
     def test_runs_full_episode_random_panel(self, seed: int) -> None:
-        panel = generate_random_panel(seed=seed)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=seed,
+        )
         env = PanelEnv(panel)
         total, infos = run_episode(env, greedy_cost_aware_action)
         assert len(infos) == env.n_members
@@ -371,7 +383,7 @@ class TestRunEpisode:
         assert total == pytest.approx(reconstructed, rel=1e-6)
 
     def test_infos_length_matches_n_members(self) -> None:
-        panel = generate_random_panel(seed=0)
+        panel = generate_panel(wall_length=feet(12), openings=[{"type": "window", "width": inches(36)}], seed=0)
         env = PanelEnv(panel)
         _, infos = run_episode(env, greedy_cost_aware_action)
         assert len(infos) == env.n_members
@@ -406,7 +418,11 @@ class TestBaselineComparison:
     @pytest.mark.parametrize("seed", list(range(20)))
     def test_both_complete_random_episodes(self, seed: int) -> None:
         """Both baselines must always produce valid, complete episodes."""
-        panel = generate_random_panel(seed=seed)
+        panel = generate_panel(
+            wall_length=feet(12),
+            openings=[{"type": "window", "width": inches(36)}],
+            seed=seed,
+        )
         env_n = PanelEnv(panel)
         env_c = PanelEnv(panel)
         total_n, infos_n = run_episode(env_n, greedy_nearest_action)
@@ -431,7 +447,11 @@ class TestBaselineComparison:
         total_c_sum = 0.0
         n_seeds = 50
         for seed in range(n_seeds):
-            panel = generate_random_panel(seed=seed)
+            panel = generate_panel(
+                wall_length=feet(12),
+                openings=[{"type": "window", "width": inches(36)}],
+                seed=seed,
+            )
             env_n = PanelEnv(panel, collision_penalty_multiplier=2.0)
             env_c = PanelEnv(panel, collision_penalty_multiplier=2.0)
             total_n, _ = run_episode(env_n, greedy_nearest_action)
