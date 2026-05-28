@@ -23,15 +23,17 @@ Full options::
 from __future__ import annotations
 
 import argparse
-import os
+import dataclasses
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
+from loguru import logger
 
 from framed.baselines import greedy_cost_aware_action, greedy_nearest_action, run_episode
-from framed.config import TrainConfig
+from framed.config import TrainConfig, logger
 from framed.env import PanelEnv
 
 
@@ -169,7 +171,8 @@ def save_eval_gifs(
     from framed.visualize import save_episode_gif
 
     model = MaskablePPO.load(model_path)
-    os.makedirs(gif_dir, exist_ok=True)
+    out = Path(gif_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
     def _model_policy(env: PanelEnv) -> int:
         action, _ = model.predict(
@@ -177,7 +180,6 @@ def save_eval_gifs(
         )
         return int(action)
 
-    # Sort by improvement — save best 3 and worst 3
     ranked = sorted(
         zip(results, panels), key=lambda x: x[0]["improvement_vs_nearest"]
     )
@@ -189,9 +191,10 @@ def save_eval_gifs(
         to_save.append((f"best_{name}", env))
 
     for label, env in to_save:
-        path = os.path.join(gif_dir, f"{label}.gif")
-        save_episode_gif(env, _model_policy, path,
+        path = out / f"{label}.gif"
+        save_episode_gif(env, _model_policy, str(path),
                          policy_name="Trained Policy", fps=20)
+        logger.info(f"saved {path}")
 
 
 # ------------------------------------------------------------------ #
@@ -218,25 +221,20 @@ def main() -> None:
     args = _parse()
     config = TrainConfig()
     if args.collision_penalty is not None:
-        import dataclasses
         config = dataclasses.replace(
             config, collision_penalty_multiplier=args.collision_penalty
         )
 
-    # Derive target member count from the model's observation space.
-    # obs shape = 3 + 16*MAX_MEMBERS — used only for the console message.
     from sb3_contrib import MaskablePPO
     model = MaskablePPO.load(args.model)
     obs_dim = model.observation_space.shape[0]
-    print(f"Model loaded  (obs dim = {obs_dim})")
-    del model  # free memory; evaluate_model reloads it
+    logger.info(f"model loaded  (obs dim = {obs_dim})")
+    del model
 
-    # Evaluation panels — seeded outside the training range.
     panels = _make_same_topology_panels(config, n=args.n_panels)
     results = evaluate_model(args.model, panels, config)
     print_results(results, f"Evaluation — {args.n_panels} unseen panels")
 
-    # GIFs
     if args.save_gifs:
         save_eval_gifs(args.model, results, panels, args.save_gifs)
 

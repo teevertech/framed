@@ -17,6 +17,8 @@ dependencies = [
     "pillow>=12.2.0",
     "onnx>=1.21.0",
     "onnxscript>=0.7.0",
+    "loguru>=0.7",
+    "python-dotenv>=1.0",
 ]
 
 [dependency-groups]

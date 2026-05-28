@@ -19,12 +19,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from framed.baselines import greedy_cost_aware_action, greedy_nearest_action, run_episode
+from framed.config import logger
 from framed.env import PanelEnv
 from framed.panel import Panel
 
@@ -123,7 +125,7 @@ class EvalCallback(BaseCallback):
         aim_run: Run,
         run_name: str = "run",
         eval_freq: int = 10_000,
-        gif_dir: str = "gifs",
+        gif_dir: Path | None = None,
         gif_fps: int = 20,
         verbose: int = 0,
     ) -> None:
@@ -133,10 +135,10 @@ class EvalCallback(BaseCallback):
         self._eval_freq       = eval_freq
         self._last_eval_step  = 0
         self._gif_fps         = gif_fps
-        self._gif_dir         = os.path.join(gif_dir, run_name) if gif_dir else ""
+        self._gif_dir         = gif_dir
 
-        if self._gif_dir:
-            os.makedirs(self._gif_dir, exist_ok=True)
+        if self._gif_dir is not None:
+            self._gif_dir.mkdir(parents=True, exist_ok=True)
 
         self._eval_envs: list[PanelEnv] = [
             PanelEnv(panel,
@@ -168,12 +170,14 @@ class EvalCallback(BaseCallback):
         self._aim_run.track(float(np.mean(p_scores)), name="eval/policy_reward",     step=step)
 
         if self.verbose >= 1:
-            print(f"[eval @ {step:,}]  "
-                  f"policy={np.mean(p_scores):.2f}  "
-                  f"nearest={np.mean(n_scores):.2f}  "
-                  f"cost_aware={np.mean(c_scores):.2f}")
+            logger.info(
+                f"[eval @ {step:,}]  "
+                f"policy={np.mean(p_scores):.2f}  "
+                f"nearest={np.mean(n_scores):.2f}  "
+                f"cost_aware={np.mean(c_scores):.2f}"
+            )
 
-        if self._gif_dir:
+        if self._gif_dir is not None:
             self._save_gif(step)
 
     def _eval_policy(self, env: PanelEnv) -> float:
@@ -264,13 +268,13 @@ class EvalCallback(BaseCallback):
             anim = FuncAnimation(fig, _draw, frames=n,
                                  interval=1000 / self._gif_fps,
                                  repeat=False, blit=False)
-            gif_path = os.path.join(self._gif_dir, f"step_{step:08d}.gif")
-            anim.save(gif_path, writer="pillow", fps=self._gif_fps, dpi=100)
+            gif_path = self._gif_dir / f"step_{step:08d}.gif"
+            anim.save(str(gif_path), writer="pillow", fps=self._gif_fps, dpi=100)
             plt.close(fig)
 
             if self.verbose >= 1:
-                print(f"[gif] saved → {gif_path}")
+                logger.info(f"gif saved → {gif_path}")
 
         except Exception as exc:
             if self.verbose >= 1:
-                print(f"[gif] warning: could not save at step {step}: {exc}")
+                logger.warning(f"could not save gif at step {step}: {exc}")

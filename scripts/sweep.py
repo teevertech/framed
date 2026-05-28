@@ -39,8 +39,8 @@ from itertools import product
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from framed.config import TrainConfig
-from train import train   # scripts/train.py is on sys.path when run from scripts/
+from framed.config import AIM_REPO, GIFS_DIR, TrainConfig, logger
+from train import train
 
 
 # ------------------------------------------------------------------ #
@@ -66,7 +66,7 @@ def portfolio_sweep() -> list[TrainConfig]:
         n_envs=8,
         eval_freq=25_000,
         checkpoint_freq=75_000,
-        gif_dir="gifs",
+        gif_dir=GIFS_DIR,
         gif_fps=20,
     )
     return [
@@ -117,7 +117,7 @@ def overnight_sweep() -> list[TrainConfig]:
 
     Overhead is minimised for sweep runs:
       - eval_freq=50_000  (not 10k — 10× fewer evals, still enough for aim curves)
-      - gif_dir="gifs"     (kept — at 50k eval_freq the overhead is minimal)
+      - gif_dir=GIFS_DIR     (kept — at 50k eval_freq the overhead is minimal)
       - checkpoint_freq=250_000 (only a couple checkpoints per run, plus final model)
       - n_eval_panels=3   (3 panels is enough to see trends; 5 is for final eval)
 
@@ -136,7 +136,7 @@ def overnight_sweep() -> list[TrainConfig]:
     lean = dict(
         eval_freq=50_000,
         checkpoint_freq=250_000,
-        gif_dir="gifs",
+        gif_dir=GIFS_DIR,
         n_eval_panels=3,
     )
 
@@ -207,7 +207,7 @@ def benchmark_sweep() -> list[TrainConfig]:
         eval_freq=25_000,
         checkpoint_freq=50_000,
         n_eval_panels=2,
-        gif_dir="",
+        gif_dir=None,
     )
     return [
         dataclasses.replace(
@@ -262,7 +262,7 @@ DEFAULT_SWEEP = "overnight"
 
 def run_sweep(sweep_name: str) -> None:
     if sweep_name not in SWEEPS:
-        print(f"Unknown sweep {sweep_name!r}.  Available: {list(SWEEPS)}")
+        logger.error(f"Unknown sweep {sweep_name!r}.  Available: {list(SWEEPS)}")
         sys.exit(1)
 
     configs = SWEEPS[sweep_name]()
@@ -272,18 +272,18 @@ def run_sweep(sweep_name: str) -> None:
     est_minutes = total_steps / 100_000 * 6
     est_hours = est_minutes / 60
 
-    print(f"\nSweep '{sweep_name}': {n} run(s)")
-    print(f"  total timesteps: {total_steps:,}")
-    print(f"  estimated time:  {est_hours:.1f} hr ({est_minutes:.0f} min)")
-    print()
+    logger.info(f"\nSweep '{sweep_name}': {n} run(s)")
+    logger.info(f"  total timesteps: {total_steps:,}")
+    logger.info(f"  estimated time:  {est_hours:.1f} hr ({est_minutes:.0f} min)")
+    logger.info("")
 
     for i, cfg in enumerate(configs, 1):
-        print(f"─── Run {i}/{n}: {cfg.effective_run_name()} ───")
+        logger.info(f"─── Run {i}/{n}: {cfg.effective_run_name()} ───")
         _print_diff(cfg)
         train(cfg)
-        print()
+        logger.info("")
 
-    print(f"Sweep complete.  View results:\n  aim ui --repo {configs[0].aim_repo}")
+    logger.info(f"Sweep complete.  View results:\n  aim ui --repo {AIM_REPO}")
 
 
 def _print_diff(config: TrainConfig) -> None:
@@ -294,7 +294,7 @@ def _print_diff(config: TrainConfig) -> None:
         if v != dataclasses.asdict(default).get(k)
     }
     for k, v in diffs.items():
-        print(f"  {k} = {v}")
+        logger.info(f"  {k} = {v}")
 
 
 def main() -> None:

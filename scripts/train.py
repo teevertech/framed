@@ -32,12 +32,13 @@ All run artefacts land under ``models/{run_name}/``::
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Allow running from the project root: ``python scripts/train.py``.
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import numpy as np
@@ -50,7 +51,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from framed.baselines import greedy_nearest_action, run_episode
 from framed.callbacks import AimTrainingCallback, EvalCallback
-from framed.config import TrainConfig
+from framed.config import AIM_REPO, GIFS_DIR, MODELS_DIR, TrainConfig, logger
 from framed.env import MAX_MEMBERS, OBS_DIM, PanelEnv, RandomPanelEnv
 from framed.panel import Panel
 
@@ -72,7 +73,6 @@ def _make_env_fn(config: TrainConfig, rank: int):
             robot_speed=config.robot_speed,
             collision_penalty_multiplier=config.collision_penalty_multiplier,
         )
-        # ActionMasker exposes action_masks() in the form MaskablePPO expects.
         return ActionMasker(env, lambda e: e.action_masks())
     return _fn
 
@@ -86,12 +86,7 @@ def _compute_eval_summary(
     config: TrainConfig,
     panels: list[Panel],
 ) -> dict:
-    """Run the trained policy and greedy-nearest on *panels* and summarise.
-
-    Returns a dict matching the ``eval_summary`` field of ``run_metadata.json``.
-    Panels are evaluated one at a time (no vectorisation needed here — this
-    runs once at the end of training).
-    """
+    """Run the trained policy and greedy-nearest on *panels* and summarise."""
     nearest_rewards: list[float] = []
     policy_rewards:  list[float] = []
 
@@ -101,11 +96,8 @@ def _compute_eval_summary(
             robot_speed=config.robot_speed,
             collision_penalty_multiplier=config.collision_penalty_multiplier,
         )
-
-        # Greedy nearest baseline.
         nearest_rewards.append(run_episode(env, greedy_nearest_action)[0])
 
-        # Trained policy (deterministic).
         obs, _ = env.reset()
         total = 0.0
         for _ in range(env.n_members):
@@ -135,23 +127,17 @@ def _compute_eval_summary(
     }
 
 
-def _collect_checkpoint_entries(ckpt_dir: str) -> list[dict]:
-    """Scan *ckpt_dir* for SB3 checkpoint zips and return metadata entries.
-
-    SB3's ``CheckpointCallback`` produces files named
-    ``model_{timestep}_steps.zip``.  We parse the timestep from the filename
-    and sort chronologically.
-    """
+def _collect_checkpoint_entries(ckpt_dir: Path) -> list[dict]:
+    """Scan *ckpt_dir* for SB3 checkpoint zips and return metadata entries."""
     entries = []
-    if not os.path.isdir(ckpt_dir):
+    if not ckpt_dir.is_dir():
         return entries
     pattern = re.compile(r"model_(\d+)_steps\.zip$")
-    for fname in os.listdir(ckpt_dir):
-        m = pattern.match(fname)
+    for fname in ckpt_dir.iterdir():
+        m = pattern.match(fname.name)
         if m:
             timestep = int(m.group(1))
-            name = f"step_{timestep:06d}"
-            entries.append({"name": name, "timestep": timestep})
+            entries.append({"name": f"step_{timestep:06d}", "timestep": timestep})
     entries.sort(key=lambda e: e["timestep"])
     return entries
 
@@ -167,48 +153,40 @@ def train(config: TrainConfig) -> None:
     by ``scripts/sweep.py`` for hyperparameter sweeps.
     """
     run_name = config.effective_run_name()
-    run_dir  = os.path.join(config.checkpoint_dir, run_name)
-    ckpt_dir = os.path.join(run_dir, "checkpoints")
-    os.makedirs(run_dir,  exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
+    run_dir  = config.run_dir()
+    ckpt_dir = config.ckpt_dir()
+    gif_dir  = config.run_gif_dir()
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     created_at = datetime.now(timezone.utc).isoformat()
 
-    # ------------------------------------------------------------------ #
-    # Seeding                                                              #
-    # ------------------------------------------------------------------ #
     np.random.seed(config.seed)
 
     # ------------------------------------------------------------------ #
-    # aim run                                                              #
+    # Aim run                                                              #
     # ------------------------------------------------------------------ #
-    aim_run = Run(repo=config.aim_repo, experiment=config.experiment_name)
+    aim_run = Run(repo=str(AIM_REPO), experiment=config.experiment_name)
     aim_run.name = run_name
     aim_run["hparams"] = config.as_dict()
-    print(f"\n{'='*60}")
-    print(f"  run : {run_name}")
-    print(f"  hash: {config.run_id()}")
-    print(f"  aim : {config.aim_repo}  (experiment: {config.experiment_name})")
-    print(f"  out : {run_dir}")
-    print(f"{'='*60}\n")
+
+    logger.info(f"run  : {run_name}")
+    logger.info(f"hash : {config.run_id()}")
+    logger.info(f"aim  : {AIM_REPO}  (experiment: {config.experiment_name})")
+    logger.info(f"out  : {run_dir}")
 
     # ------------------------------------------------------------------ #
     # Training envs                                                        #
     # ------------------------------------------------------------------ #
     vec_env = SubprocVecEnv(
         [_make_env_fn(config, rank=i) for i in range(config.n_envs)],
-        start_method="spawn",  # spawn = fresh process per worker, no inherited
-                               # state from the parent. fork is faster to start
-                               # but inherits aim/SB3 thread state and deadlocks
-                               # on the second sequential run in sweep.py.
+        start_method="spawn",
     )
 
     # ------------------------------------------------------------------ #
     # Eval panels (fixed for the life of the run)                          #
     # ------------------------------------------------------------------ #
-    # Seed 99_999 is well outside the training range [seed, seed+n_envs).
-    # Padding handles variable member counts across panels, so no member-
-    # count matching is needed here.
     eval_generator = config.make_panel_generator(seed=99_999)
     eval_panels = [eval_generator() for _ in range(config.n_eval_panels)]
 
@@ -217,7 +195,7 @@ def train(config: TrainConfig) -> None:
     # ------------------------------------------------------------------ #
     if config.torch_threads > 0:
         torch.set_num_threads(config.torch_threads)
-        print(f"  torch threads: {config.torch_threads}")
+        logger.info(f"torch threads: {config.torch_threads}")
 
     # ------------------------------------------------------------------ #
     # Model                                                                #
@@ -245,23 +223,20 @@ def train(config: TrainConfig) -> None:
     # Callbacks                                                            #
     # ------------------------------------------------------------------ #
     callbacks = CallbackList([
-        AimTrainingCallback(
-            aim_run=aim_run,
-            n_envs=config.n_envs,
-        ),
+        AimTrainingCallback(aim_run=aim_run, n_envs=config.n_envs),
         EvalCallback(
             config=config,
             eval_panels=eval_panels,
             aim_run=aim_run,
             run_name=run_name,
             eval_freq=config.eval_freq,
-            gif_dir=config.gif_dir,
+            gif_dir=gif_dir,
             gif_fps=config.gif_fps,
             verbose=1,
         ),
         CheckpointCallback(
             save_freq=config.checkpoint_freq // config.n_envs,
-            save_path=ckpt_dir,
+            save_path=str(ckpt_dir),
             name_prefix="model",
             verbose=1,
         ),
@@ -278,43 +253,39 @@ def train(config: TrainConfig) -> None:
             progress_bar=True,
         )
     finally:
-        # Always save the final model and close workers — even on Ctrl-C.
-        final_zip_path = os.path.join(run_dir, "final_model")
-        model.save(final_zip_path)
-        print(f"\nFinal model saved → {final_zip_path}.zip")
+        final_zip_path = run_dir / "final_model"
+        model.save(str(final_zip_path))
+        logger.info(f"final model saved → {final_zip_path}.zip")
         vec_env.close()
         aim_run.close()
 
     # ------------------------------------------------------------------ #
     # ONNX export                                                          #
     # ------------------------------------------------------------------ #
-    # Export to ONNX for future client-side inference.
-    # The obs is a flat float32 vector; masking is applied externally.
     try:
         dummy_obs = torch.zeros(1, OBS_DIM, dtype=torch.float32)
-        onnx_path = os.path.join(run_dir, "final_model.onnx")
+        onnx_path = run_dir / "final_model.onnx"
         torch.onnx.export(
             model.policy,
             dummy_obs,
-            onnx_path,
+            str(onnx_path),
             input_names=["obs"],
             output_names=["action_logits", "value"],
             opset_version=17,
         )
-        print(f"ONNX model saved → {onnx_path}")
+        logger.info(f"ONNX model saved → {onnx_path}")
     except Exception as e:
-        print(f"[onnx] export failed (non-fatal): {e}")
+        logger.warning(f"ONNX export failed (non-fatal): {e}")
 
     # ------------------------------------------------------------------ #
     # Post-training eval summary                                           #
     # ------------------------------------------------------------------ #
-    print("\nRunning post-training evaluation...")
-    # Generate a fresh set of panels distinct from the training/eval sets.
+    logger.info("running post-training evaluation...")
     summary_generator = config.make_panel_generator(seed=999_999)
     summary_panels = [summary_generator() for _ in range(20)]
     eval_summary = _compute_eval_summary(model, config, summary_panels)
-    print(
-        f"  policy={eval_summary['mean_policy_reward']:.1f}  "
+    logger.info(
+        f"policy={eval_summary['mean_policy_reward']:.1f}  "
         f"nearest={eval_summary['mean_nearest_reward']:.1f}  "
         f"wins={eval_summary['win_rate']}/{eval_summary['n_panels']}  "
         f"improvement={eval_summary['mean_improvement_pct']:+.1f}%"
@@ -324,7 +295,6 @@ def train(config: TrainConfig) -> None:
     # run_metadata.json                                                    #
     # ------------------------------------------------------------------ #
     checkpoint_entries = _collect_checkpoint_entries(ckpt_dir)
-    # Append the final model as the last checkpoint entry.
     checkpoint_entries.append({
         "name": "final_model",
         "timestep": config.total_timesteps,
@@ -344,10 +314,9 @@ def train(config: TrainConfig) -> None:
         "eval_summary": eval_summary,
     }
 
-    metadata_path = os.path.join(run_dir, "run_metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2, default=str)
-    print(f"Metadata written → {metadata_path}")
+    metadata_path = run_dir / "run_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str))
+    logger.info(f"metadata written → {metadata_path}")
 
 
 # ------------------------------------------------------------------ #
@@ -355,15 +324,10 @@ def train(config: TrainConfig) -> None:
 # ------------------------------------------------------------------ #
 
 def _parse_config(argv: list[str]) -> TrainConfig:
-    """Parse ``key=value`` CLI arguments into a ``TrainConfig``.
-
-    Unrecognised keys will raise ``TypeError`` from the dataclass
-    constructor with a clear error message.
-    """
     overrides: dict[str, str] = {}
     for arg in argv[1:]:
         if "=" not in arg:
-            print(f"[warn] ignoring argument without '=': {arg!r}", flush=True)
+            logger.warning(f"ignoring argument without '=': {arg!r}")
             continue
         key, _, val = arg.partition("=")
         overrides[key.strip()] = val.strip()

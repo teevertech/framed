@@ -1,5 +1,24 @@
-"""Training configuration for the panel-sequencing RL agent.
+"""Project paths, logging, and training configuration.
 
+Paths
+-----
+All path constants are derived from ``PROJ_ROOT`` (the repository root,
+two levels above this file).  Import them wherever a hardcoded path
+string would otherwise appear::
+
+    from framed.config import MODELS_DIR, GIFS_DIR, AIM_REPO
+
+Logging
+-------
+Loguru is configured on import to write through ``tqdm.write`` so that
+log messages don't clobber progress bars.  Every module that wants
+structured output should import ``logger`` from here rather than using
+``print`` or the stdlib ``logging`` module::
+
+    from framed.config import logger
+
+Training configuration
+----------------------
 ``TrainConfig`` is a frozen dataclass — every field has a typed default
 so a full training run needs just::
 
@@ -35,14 +54,65 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import sys
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from dotenv import load_dotenv
+from loguru import logger
 
 from framed.env import MAX_MEMBERS
-from framed.panel import Panel, generate_panel, generate_random_panel
+from framed.panel import Panel, generate_panel
 from framed.units import feet, inches
 
+# ------------------------------------------------------------------ #
+# Environment                                                          #
+# ------------------------------------------------------------------ #
+
+load_dotenv()
+
+# ------------------------------------------------------------------ #
+# Paths                                                                #
+# ------------------------------------------------------------------ #
+
+PROJ_ROOT: Path = Path(__file__).resolve().parents[2]
+"""Repository root — the directory that contains pyproject.toml."""
+
+MODELS_DIR: Path = PROJ_ROOT / "models"
+"""Root output directory for trained models and run artefacts.
+
+Each training run writes to ``MODELS_DIR / run_name /``."""
+
+GIFS_DIR: Path = PROJ_ROOT / "gifs"
+"""Root output directory for per-eval GIF snapshots."""
+
+AIM_REPO: Path = PROJ_ROOT / ".aim"
+"""Path to the Aim experiment-tracking repository."""
+
+# ------------------------------------------------------------------ #
+# Logging                                                              #
+# ------------------------------------------------------------------ #
+
+# Remove the default loguru handler and replace it with one that writes
+# through tqdm.write so that log messages don't clobber progress bars.
+# https://github.com/Delgan/loguru/issues/135
+try:
+    from tqdm import tqdm
+    if logger._core.handlers:
+        logger.remove()
+    logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
+except ModuleNotFoundError:
+    pass
+except Exception:
+    pass
+
+logger.info(f"PROJ_ROOT: {PROJ_ROOT}")
+
+
+# ------------------------------------------------------------------ #
+# TrainConfig                                                          #
+# ------------------------------------------------------------------ #
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -128,13 +198,6 @@ class TrainConfig:
     """Human-readable label for this run.  Auto-generated from the config
     hash if left empty."""
 
-    aim_repo: str = ".aim"
-    """Path to the aim repository (created on first use)."""
-
-    checkpoint_dir: str = "models"
-    """Root directory for model output.  Each run writes to
-    ``{checkpoint_dir}/{run_name}/``."""
-
     checkpoint_freq: int = 50_000
     """Save a checkpoint every N timesteps."""
 
@@ -143,10 +206,6 @@ class TrainConfig:
 
     n_eval_panels: int = 5
     """Number of fixed panels used for evaluation (baseline + policy)."""
-
-    gif_dir: str = "gifs"
-    """Directory for per-eval GIF snapshots.  Set to '' to disable.
-    Note: ``EvalCallback`` overrides this to ``models/{run_name}/gifs/``."""
 
     gif_fps: int = 20
     """Frame rate for saved GIFs."""
@@ -168,12 +227,20 @@ class TrainConfig:
         Returns ``MAX_MEMBERS`` (currently 50).  Individual panels produced
         by the sampling distribution may have fewer real members; the env
         pads the observation to this size automatically.
-
-        The old per-config member count (derived from a single wall length and
-        opening width) is no longer meaningful now that the generator samples
-        from a distribution.
         """
         return MAX_MEMBERS
+
+    def run_dir(self) -> Path:
+        """Per-run output directory: ``MODELS_DIR / effective_run_name``."""
+        return MODELS_DIR / self.effective_run_name()
+
+    def ckpt_dir(self) -> Path:
+        """Checkpoint subdirectory inside ``run_dir``."""
+        return self.run_dir() / "checkpoints"
+
+    def run_gif_dir(self) -> Path:
+        """GIF subdirectory inside ``run_dir``."""
+        return self.run_dir() / "gifs"
 
     def effective_run_name(self) -> str:
         """Return ``run_name`` if set, otherwise ``{experiment}_{hash[:8]}``."""
@@ -191,8 +258,7 @@ class TrainConfig:
         widths are in the pool, or in their run name, share the same id.
         """
         exclude = {
-            "experiment_name", "run_name", "aim_repo",
-            "checkpoint_dir", "seed",
+            "experiment_name", "run_name", "seed",
             # Infrastructure fields — don't affect learning dynamics.
             "device", "torch_threads",
             # Distribution pool fields — describe the sampling range, not a
